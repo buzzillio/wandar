@@ -38,7 +38,7 @@ class SelectivityStatsLight:
             n_to_sample = min(50, n_rows, self.max_samples - len(self.samples))
             if n_to_sample > 0:
                 indices = torch.randperm(n_rows, device=x.device)[:n_to_sample]
-                sampled = x[indices].cpu()  # [n_to_sample, num_channels]
+                sampled = x[indices].cpu().float()  # [n_to_sample, num_channels] - ensure float dtype
                 self.samples.append(sampled)
     
     def finalize(self) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -53,6 +53,10 @@ class SelectivityStatsLight:
         
         # Stack all samples: [total_samples, num_channels]
         all_samples = torch.cat(self.samples, dim=0)  # [N, C]
+        
+        # Ensure tensor is float for quantile operations
+        if all_samples.dtype not in [torch.float32, torch.float64]:
+            all_samples = all_samples.float()
         
         # Compute per-channel stats in batch
         mean_per_channel = all_samples.mean(dim=0)  # [C]
