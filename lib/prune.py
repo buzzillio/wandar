@@ -222,13 +222,9 @@ def prune_neuronrank_unstructured(args, model, tokenizer, device=torch.device("c
         if num_to_prune <= 0:
             return 0, numel
 
-        flat_metric = metric_tensor.flatten()
-        if metric_tensor.device.type == 'cuda':
-            flat_metric = flat_metric.cuda()
+        flat_metric = metric_tensor.reshape(-1)
         threshold_idx = min(num_to_prune, flat_metric.numel() - 1)
         threshold = torch.sort(flat_metric)[0][threshold_idx]
-        if metric_tensor.device.type == 'cpu':
-            threshold = threshold.cpu()
         mask = metric_tensor <= threshold
         weight_tensor[mask] = 0
         return mask.sum().item(), numel
@@ -281,23 +277,23 @@ def prune_neuronrank_unstructured(args, model, tokenizer, device=torch.device("c
             if args.sparsity_ratio <= 0:
                 continue
 
-            metric = torch.abs(weight) * magnitude_scale
+            metric = None
+            if magnitude_scale != 0.0:
+                metric = torch.abs(weight).to(torch.float32) * magnitude_scale
 
             if (
                 layer_variance is not None
                 and "mlp" in name
             ):
-                variance_vec = layer_variance.to(metric.device, dtype=metric.dtype)
-                
+                variance_vec = layer_variance.to(weight.device, dtype=torch.float32)
                 if args.variance_exp == 0.0:
                     variance_term = torch.ones_like(variance_vec)
                 elif args.variance_exp == 1.0:
                     variance_term = variance_vec
                 else:
                     variance_term = torch.pow(variance_vec.clamp(min=1e-12), args.variance_exp)
-                
+
                 variance_component = variance_term * args.variance_multi
-                
                 if "gate_proj" in name or "up_proj" in name:
                     addition = variance_component.view(-1, 1)
                 elif "down_proj" in name:
@@ -305,7 +301,19 @@ def prune_neuronrank_unstructured(args, model, tokenizer, device=torch.device("c
                 else:
                     addition = None
                 if addition is not None:
+                    addition = addition.to(weight.device, dtype=torch.float32)
+                    if metric is None:
+                        metric = torch.zeros_like(weight, dtype=torch.float32)
                     metric = metric + addition
+
+            if metric is None:
+                continue
+
+            if not torch.isfinite(metric).all():
+                metric = torch.nan_to_num(metric, nan=0.0, posinf=0.0, neginf=0.0)
+
+            if torch.count_nonzero(metric).item() == 0:
+                continue
 
             pruned, numel = _apply_unstructured_mask(weight, metric, args.sparsity_ratio)
             total_pruned += pruned
