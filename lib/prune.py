@@ -358,12 +358,21 @@ def prune_neuronrank_unstructured(args, model, tokenizer, device=torch.device("c
                 and "mlp" in name
             ):
                 variance_vec = layer_variance.to(weight.device, dtype=torch.float32)
+                
+                # Debug: print variance stats for last few layers
+                if i >= total_layers - 3:
+                    print(f"[DEBUG] Layer {i} {name}: variance min={variance_vec.min():.6f}, max={variance_vec.max():.6f}, mean={variance_vec.mean():.6f}")
+                
                 if args.variance_exp == 0.0:
                     variance_term = torch.ones_like(variance_vec)
                 elif args.variance_exp == 1.0:
                     variance_term = variance_vec
                 else:
                     variance_term = torch.pow(variance_vec.clamp(min=1e-12), args.variance_exp)
+                
+                # Debug: print transformed variance stats
+                if i >= total_layers - 3:
+                    print(f"[DEBUG] Layer {i} {name}: variance_term (exp={args.variance_exp}) min={variance_term.min():.6f}, max={variance_term.max():.6f}, mean={variance_term.mean():.6f}")
 
                 variance_component = variance_term * args.variance_multi
                 if "gate_proj" in name or "up_proj" in name:
@@ -377,6 +386,10 @@ def prune_neuronrank_unstructured(args, model, tokenizer, device=torch.device("c
                     if metric is None:
                         metric = torch.zeros_like(weight, dtype=torch.float32)
                     metric = metric + addition
+                    
+                    # Debug: print final metric stats
+                    if i >= total_layers - 3:
+                        print(f"[DEBUG] Layer {i} {name}: metric (after variance) min={metric.min():.6f}, max={metric.max():.6f}, mean={metric.mean():.6f}")
 
             if metric is None:
                 continue
