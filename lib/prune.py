@@ -169,8 +169,17 @@ def prune_magnitude(args, model, tokenizer, device=torch.device("cuda:0"), prune
                         tmp = W_metric[:,ii:(ii+prune_m)].float()
                         W_mask.scatter_(1,ii+torch.topk(tmp, prune_n,dim=1, largest=False)[1], True)
             else:
-                thresh = torch.sort(W_metric.flatten().cuda())[0][int(W.numel()*args.sparsity_ratio)].cpu()
-                W_mask = (W_metric<=thresh)
+                # Memory-efficient thresholding using kthvalue instead of sorting
+                with torch.no_grad():
+                    flat = W_metric.detach().reshape(-1)  # stays on GPU
+                    k = int(flat.numel() * args.sparsity_ratio)
+                    if k > 0 and k < flat.numel():
+                        thresh = flat.kthvalue(k).values  # GPU scalar
+                    elif k == 0:
+                        thresh = flat.min() - 1  # prune nothing
+                    else:
+                        thresh = flat.max() + 1  # prune everything
+                    W_mask = (W_metric <= thresh)
 
             W[W_mask] = 0
 
@@ -358,21 +367,12 @@ def prune_neuronrank_unstructured(args, model, tokenizer, device=torch.device("c
                 and "mlp" in name
             ):
                 variance_vec = layer_variance.to(weight.device, dtype=torch.float32)
-                
-                # Debug: print variance stats for last few layers
-                if i >= total_layers - 3:
-                    print(f"[DEBUG] Layer {i} {name}: variance min={variance_vec.min():.6f}, max={variance_vec.max():.6f}, mean={variance_vec.mean():.6f}")
-                
                 if args.variance_exp == 0.0:
                     variance_term = torch.ones_like(variance_vec)
                 elif args.variance_exp == 1.0:
                     variance_term = variance_vec
                 else:
                     variance_term = torch.pow(variance_vec.clamp(min=1e-12), args.variance_exp)
-                
-                # Debug: print transformed variance stats
-                if i >= total_layers - 3:
-                    print(f"[DEBUG] Layer {i} {name}: variance_term (exp={args.variance_exp}) min={variance_term.min():.6f}, max={variance_term.max():.6f}, mean={variance_term.mean():.6f}")
 
                 variance_component = variance_term * args.variance_multi
                 if "gate_proj" in name or "up_proj" in name:
@@ -386,10 +386,6 @@ def prune_neuronrank_unstructured(args, model, tokenizer, device=torch.device("c
                     if metric is None:
                         metric = torch.zeros_like(weight, dtype=torch.float32)
                     metric = metric + addition
-                    
-                    # Debug: print final metric stats
-                    if i >= total_layers - 3:
-                        print(f"[DEBUG] Layer {i} {name}: metric (after variance) min={metric.min():.6f}, max={metric.max():.6f}, mean={metric.mean():.6f}")
 
             if metric is None:
                 continue
@@ -420,6 +416,159 @@ def prune_neuronrank_unstructured(args, model, tokenizer, device=torch.device("c
     if total_weights:
         pct = 100.0 * total_pruned / total_weights
         print(f"[NeuronRank-Unstructured] global pruning ratio {pct:.2f}% ({total_pruned}/{total_weights})")
+
+
+def prune_neuronrank_old(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0, prune_m=0):
+    """Old NeuronRank formula: score = |W|^α × TF^β × IDF^γ
+    
+    Supports both structured (per-neuron) and unstructured (per-weight) pruning.
+    """
+    use_cache = model.config.use_cache
+    model.config.use_cache = False
+
+    print("Loading calibration data for NeuronRank-OLD")
+    dataloader, _ = get_loaders(
+        "c4",
+        nsamples=args.nsamples,
+        seed=args.seed,
+        seqlen=model.seqlen,
+        tokenizer=tokenizer,
+    )
+
+    print("Collecting TF-IDF statistics")
+    from lib.neuronrank import collect_neuronrank_old_statistics, compute_neuronrank_old_scores
+    
+    stats = collect_neuronrank_old_statistics(model, dataloader, device)
+    
+    # Get exponents from args (default to 1.0 if not specified)
+    weight_exp = getattr(args, 'weight_exp', 1.0)
+    tf_exp = getattr(args, 'tf_exp', 1.0)
+    idf_exp = getattr(args, 'idf_exp', 1.0)
+    
+    print(f"Computing scores with exponents: weight={weight_exp}, TF={tf_exp}, IDF={idf_exp}")
+    scores = compute_neuronrank_old_scores(
+        model,
+        stats,
+        weight_exp=weight_exp,
+        tf_exp=tf_exp,
+        idf_exp=idf_exp,
+    )
+
+    layers = model.model.layers
+    total_layers = len(layers)
+    total_pruned = 0
+    total_weights = 0
+
+    if args.sparsity_type == "unstructured":
+        # Unstructured pruning: prune individual weights
+        def _apply_unstructured_mask(weight_tensor, metric_tensor, ratio):
+            numel = metric_tensor.numel()
+            num_to_prune = int(numel * ratio)
+            if num_to_prune <= 0:
+                return 0, numel
+
+            flat_metric = metric_tensor.reshape(-1)
+            threshold_idx = min(num_to_prune, flat_metric.numel() - 1)
+            threshold = torch.sort(flat_metric)[0][threshold_idx]
+            mask = metric_tensor <= threshold
+            weight_tensor[mask] = 0
+            return mask.sum().item(), numel
+
+        for i, layer in enumerate(layers):
+            subset = find_layers(layer)
+            layer_scores = scores.get(i)
+            
+            for name, module in subset.items():
+                # Check pruning_last flag
+                if not should_prune_module(args, i, total_layers, name):
+                    if args.pruning_last is not None:
+                        print(f"Skipping layer {i} module {name} (not in last {args.pruning_last} MLP layers)")
+                    continue
+                
+                if "mlp" not in name:
+                    continue
+
+                weight = module.weight.data
+                if args.sparsity_ratio <= 0:
+                    continue
+
+                # Build metric from neuron scores
+                if layer_scores is None:
+                    metric = torch.abs(weight).to(torch.float32)
+                else:
+                    neuron_scores = layer_scores.to(weight.device, dtype=torch.float32)
+                    
+                    # Broadcast neuron scores to weight dimensions
+                    if "gate_proj" in name or "up_proj" in name:
+                        metric = neuron_scores.view(-1, 1).expand_as(weight)
+                    elif "down_proj" in name:
+                        metric = neuron_scores.view(1, -1).expand_as(weight)
+                    else:
+                        metric = torch.abs(weight).to(torch.float32)
+
+                if not torch.isfinite(metric).all():
+                    metric = torch.nan_to_num(metric, nan=0.0, posinf=0.0, neginf=0.0)
+
+                if torch.count_nonzero(metric).item() == 0:
+                    continue
+
+                pruned, numel = _apply_unstructured_mask(weight, metric, args.sparsity_ratio)
+                total_pruned += pruned
+                total_weights += numel
+
+                print(f"[NeuronRank-OLD] layer {i} {name} pruned {pruned}/{numel}")
+
+    else:
+        # Structured pruning: prune entire neurons
+        for i, layer in enumerate(layers):
+            # Check pruning_last flag
+            if args.pruning_last is not None:
+                layers_to_prune = total_layers - args.pruning_last
+                if i < layers_to_prune:
+                    print(f"Skipping layer {i} (not in last {args.pruning_last} layers)")
+                    continue
+
+            layer_score = scores.get(i)
+            if layer_score is None:
+                continue
+
+            gate_proj = getattr(layer.mlp, "gate_proj", None)
+            up_proj = getattr(layer.mlp, "up_proj", None)
+            down_proj = getattr(layer.mlp, "down_proj", None)
+            if gate_proj is None:
+                continue
+
+            num_channels = layer_score.numel()
+            total_weights += num_channels
+            num_to_prune = int(num_channels * args.sparsity_ratio)
+            if num_to_prune <= 0:
+                continue
+
+            prune_idx = torch.argsort(layer_score)[:num_to_prune]
+            prune_idx_list = prune_idx.tolist()
+
+            gate_proj.weight.data[prune_idx_list, :] = 0
+            if gate_proj.bias is not None:
+                gate_proj.bias.data[prune_idx_list] = 0
+
+            if up_proj is not None:
+                up_proj.weight.data[prune_idx_list, :] = 0
+                if up_proj.bias is not None:
+                    up_proj.bias.data[prune_idx_list] = 0
+
+            if down_proj is not None:
+                down_proj.weight.data[:, prune_idx_list] = 0
+
+            total_pruned += num_to_prune
+            layer_pct = 100.0 * num_to_prune / num_channels
+            print(f"[NeuronRank-OLD] layer {i}: pruned {num_to_prune}/{num_channels} channels ({layer_pct:.2f}%)")
+
+    model.config.use_cache = use_cache
+    torch.cuda.empty_cache()
+
+    if total_weights:
+        pct = 100.0 * total_pruned / total_weights
+        print(f"[NeuronRank-OLD] global pruning ratio {pct:.2f}% ({total_pruned}/{total_weights})")
 
 
 def prune_wanda_idf(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0, prune_m=0):

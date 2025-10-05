@@ -4,6 +4,65 @@ import torch
 import torch.nn.functional as F
 
 
+class TFIDFStats:
+    """Track TF-IDF statistics for old NeuronRank formula.
+    
+    TF (Term Frequency): Average activation strength across all tokens
+    IDF (Inverse Document Frequency): Selectivity based on how rarely neuron fires
+    """
+
+    def __init__(self, size: int, dtype: torch.dtype = torch.float32, device: Union[torch.device, str] = "cpu"):
+        self.size = size
+        self.dtype = dtype
+        self.device = device
+        self.total_tokens = 0
+        # Sum of absolute activations for TF
+        self.activation_sum = torch.zeros(size, dtype=dtype, device=device)
+        # Count of tokens where neuron fired (activation > 0)
+        self.active_count = torch.zeros(size, dtype=torch.long, device=device)
+
+    def update(self, activations: torch.Tensor):
+        """Update statistics with a batch of activations.
+        
+        Args:
+            activations: Tensor of shape [batch_size, neuron_dim] or [batch*seq_len, neuron_dim]
+        """
+        if activations is None or activations.numel() == 0:
+            return
+        
+        activations = activations.to(device=self.device, dtype=self.dtype)
+        num_tokens = activations.shape[0]
+        
+        # TF: sum of absolute activations
+        abs_act = torch.abs(activations)
+        self.activation_sum += abs_act.sum(dim=0)
+        
+        # IDF: count where neuron is active (activation > 0)
+        active_mask = abs_act > 0
+        self.active_count += active_mask.sum(dim=0).to(torch.long)
+        
+        self.total_tokens += num_tokens
+
+    def compute_tf_idf(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute TF and IDF scores.
+        
+        Returns:
+            tf: Mean absolute activation across all tokens (higher = stronger)
+            idf: Log-based selectivity score (higher = more selective/sparse)
+        """
+        if self.total_tokens == 0:
+            return torch.zeros(self.size, device=self.device), torch.zeros(self.size, device=self.device)
+        
+        # TF: average activation strength
+        tf = self.activation_sum / self.total_tokens
+        
+        # IDF: log((T + 1) / (n_active + 1)) + 1
+        # Higher when neuron fires rarely (selective)
+        idf = torch.log((self.total_tokens + 1) / (self.active_count.to(self.dtype) + 1)) + 1
+        
+        return tf, idf
+
+
 class RunningStats:
     """Track mean and variance for high-dimensional tensors using Welford grouping."""
 
@@ -302,3 +361,157 @@ def apply_neuronrank_pruning(model, scores, sparsity_ratio):
         total_pruned += num_to_prune
 
     return total_pruned, total_channels
+
+
+def collect_neuronrank_old_statistics(model, dataloader, device):
+    """Collect TF-IDF statistics for old NeuronRank formula.
+    
+    For each MLP gate projection, tracks:
+    - TF: Average absolute activation strength across all tokens
+    - IDF: Selectivity measure based on how often neuron fires
+    """
+    
+    if not hasattr(model, "model") or not hasattr(model.model, "layers"):
+        raise ValueError("Expected the model to expose model.layers for NeuronRank scoring.")
+
+    batches = list(dataloader)
+    if not batches:
+        raise ValueError("Calibration dataloader for NeuronRank produced no batches.")
+
+    print(f"Collecting TF-IDF statistics ({len(batches)} batches)")
+
+    layer_stats = {}
+    hooks = []
+
+    for layer_idx, layer in enumerate(model.model.layers):
+        gate_proj = getattr(layer.mlp, "gate_proj", None)
+        if gate_proj is None:
+            continue
+
+        layer_device = gate_proj.weight.device
+        layer_dtype = torch.float32
+
+        layer_stats[layer_idx] = TFIDFStats(
+            size=gate_proj.out_features,
+            dtype=layer_dtype,
+            device=layer_device
+        )
+
+        def make_hook(idx):
+            def hook(_module, _inputs, output):
+                if output is None:
+                    return
+                # Apply SiLU activation
+                act = F.silu(output)
+                
+                # Flatten to [num_tokens, neuron_dim]
+                if act.dim() == 3:
+                    act_flat = act.flatten(0, 1)  # [batch*seq_len, neuron_dim]
+                else:
+                    act_flat = act
+                
+                # Update TF-IDF statistics
+                layer_stats[idx].update(act_flat)
+            
+            return hook
+
+        hooks.append(gate_proj.register_forward_hook(make_hook(layer_idx)))
+
+    model.eval()
+    with torch.no_grad():
+        for batch in batches:
+            if isinstance(batch, (tuple, list)):
+                input_ids = batch[0]
+            else:
+                input_ids = batch
+            input_ids = input_ids.to(device)
+            attention_mask = torch.ones_like(input_ids, device=device)
+            model(input_ids=input_ids, attention_mask=attention_mask)
+
+    for handle in hooks:
+        handle.remove()
+
+    # Compute final TF and IDF scores
+    stats = {}
+    for idx, tfidf_stats in layer_stats.items():
+        tf, idf = tfidf_stats.compute_tf_idf()
+        stats[idx] = {
+            "tf": tf.to(dtype=torch.float32, device="cpu"),
+            "idf": idf.to(dtype=torch.float32, device="cpu"),
+            "total_tokens": tfidf_stats.total_tokens,
+        }
+        print(f"Layer {idx}: TF range [{tf.min():.6f}, {tf.max():.6f}], "
+              f"IDF range [{idf.min():.6f}, {idf.max():.6f}], "
+              f"tokens={tfidf_stats.total_tokens}")
+    
+    return stats
+
+
+def compute_neuronrank_old_scores(
+    model,
+    stats,
+    weight_exp=1.0,
+    tf_exp=1.0, 
+    idf_exp=1.0,
+) -> Dict[int, torch.Tensor]:
+    """Compute scores using old NeuronRank formula: |W|^α × TF^β × IDF^γ
+    
+    Args:
+        model: The model to score
+        stats: TF-IDF statistics from collect_neuronrank_old_statistics
+        weight_exp: Exponent α for weight magnitude
+        tf_exp: Exponent β for term frequency (activation strength)
+        idf_exp: Exponent γ for inverse document frequency (selectivity)
+    
+    Returns:
+        Dictionary mapping layer_idx to neuron scores
+    """
+    scores = {}
+    
+    for layer_idx, layer in enumerate(model.model.layers):
+        gate_proj = getattr(layer.mlp, "gate_proj", None)
+        if gate_proj is None:
+            continue
+        
+        weight = gate_proj.weight.detach().to(dtype=torch.float32, device="cpu")
+        # Weight magnitude per neuron (L2 norm across input dimension)
+        weight_magnitude = torch.norm(weight, p=2, dim=1)
+        
+        layer_stats = stats.get(layer_idx)
+        if layer_stats is None:
+            # No statistics available, use weight magnitude only
+            scores[layer_idx] = torch.pow(weight_magnitude.clamp(min=1e-12), weight_exp)
+            continue
+        
+        tf = layer_stats["tf"].to("cpu")
+        idf = layer_stats["idf"].to("cpu")
+        
+        # Apply exponents: |W|^α × TF^β × IDF^γ
+        if weight_exp == 0.0:
+            weight_term = torch.ones_like(weight_magnitude)
+        elif weight_exp == 1.0:
+            weight_term = weight_magnitude
+        else:
+            weight_term = torch.pow(weight_magnitude.clamp(min=1e-12), weight_exp)
+        
+        if tf_exp == 0.0:
+            tf_term = torch.ones_like(tf)
+        elif tf_exp == 1.0:
+            tf_term = tf
+        else:
+            tf_term = torch.pow(tf.clamp(min=1e-12), tf_exp)
+        
+        if idf_exp == 0.0:
+            idf_term = torch.ones_like(idf)
+        elif idf_exp == 1.0:
+            idf_term = idf
+        else:
+            idf_term = torch.pow(idf.clamp(min=1e-12), idf_exp)
+        
+        # Combine: score = |W|^α × TF^β × IDF^γ
+        score = weight_term * tf_term * idf_term
+        scores[layer_idx] = score
+        
+        print(f"Layer {layer_idx} scores: min={score.min():.6e}, max={score.max():.6e}, mean={score.mean():.6e}")
+    
+    return scores
