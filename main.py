@@ -4,6 +4,10 @@ import warnings
 import importlib.util
 import subprocess
 import sys
+import time
+
+# Start timing from the very beginning
+start_time = time.time()
 
 # Check if torch is installed with proper CUDA support
 if importlib.util.find_spec("torch") is None:
@@ -59,6 +63,7 @@ from lib.neuronrank import (
     apply_neuronrank_pruning,
 )
 
+print('🕐 Starting execution timer...')
 print('torch', version('torch'))
 print('transformers', version('transformers'))
 print('accelerate', version('accelerate'))
@@ -272,6 +277,14 @@ def main():
     ################################################################
     ppl_test = eval_ppl(args, model, tokenizer, device)
     print(f"wikitext perplexity {ppl_test}")
+    
+    # Calculate and display total execution time
+    end_time = time.time()
+    total_time = end_time - start_time
+    hours, remainder = divmod(total_time, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    print(f"🕐 Total execution time: {int(hours):02d}:{int(minutes):02d}:{seconds:05.2f}")
+    print(f"🕐 Total execution time: {total_time:.2f} seconds")
 
     if not os.path.exists(args.save):
         os.makedirs(args.save)
