@@ -40,7 +40,7 @@ The [scripts](scripts) directory contains all the bash commands to replicate the
 Below is an example command for pruning LLaMA-7B with Wanda, to achieve unstructured 50% sparsity.
 ```sh
 python main.py \
-    --model decapoda-research/llama-7b-hf \
+    --model baffo32/decapoda-research/llama-7b-hf \
     --prune_method wanda \
     --sparsity_ratio 0.5 \
     --sparsity_type unstructured \
