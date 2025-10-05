@@ -10,6 +10,48 @@ from .wanda_selectivity import collect_wanda_selectivity_stats
 
 from .ablate import AblateGPT 
 
+def should_prune_layer(args, layer_idx, total_layers):
+    """
+    Determine if a layer should be pruned based on pruning_last flag.
+    
+    Args:
+        args: Command line arguments
+        layer_idx: Index of the current layer (0-based)
+        total_layers: Total number of layers in the model
+        
+    Returns:
+        bool: True if layer should be pruned, False otherwise
+    """
+    if args.pruning_last is None:
+        return True  # Prune all layers if no restriction
+    
+    # Only prune the last X layers
+    return layer_idx >= (total_layers - args.pruning_last)
+
+def should_prune_module(args, layer_idx, total_layers, module_name):
+    """
+    Determine if a specific module in a layer should be pruned.
+    
+    Args:
+        args: Command line arguments
+        layer_idx: Index of the current layer (0-based)
+        total_layers: Total number of layers in the model
+        module_name: Name of the module (e.g., 'mlp.gate_proj', 'self_attn.q_proj')
+        
+    Returns:
+        bool: True if module should be pruned, False otherwise
+    """
+    # First check if we should prune this layer at all
+    if not should_prune_layer(args, layer_idx, total_layers):
+        return False
+    
+    # If pruning_last is specified, only prune MLP modules
+    if args.pruning_last is not None:
+        return 'mlp' in module_name
+    
+    # Otherwise, follow normal pruning rules
+    return True
+
 def find_layers(module, layers=[nn.Linear], name=''):
     """
     Recursively find the layers of a certain type in a module.
@@ -106,12 +148,18 @@ def return_given_alpha(alpha, sort_res, W_metric, tmp_metric, sum_before):
 
 def prune_magnitude(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0, prune_m=0):
     layers = model.model.layers 
+    total_layers = len(layers)
 
     for i in range(len(layers)):
         layer = layers[i]
         subset = find_layers(layer)
 
         for name in subset:
+            # Check if we should prune this module based on pruning_last flag
+            if not should_prune_module(args, i, total_layers, name):
+                if args.pruning_last is not None:
+                    print(f"Skipping layer {i} module {name} (not in last {args.pruning_last} MLP layers)")
+                continue
             W = subset[name].weight.data 
             W_metric = torch.abs(W)
             if prune_n != 0:
@@ -137,9 +185,25 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
         inps, outs, attention_mask, position_ids = prepare_calibration_input(model, dataloader, device)
 
     layers = model.model.layers
+    total_layers = len(layers)
+    
     for i in range(len(layers)):
         layer = layers[i]
         subset = find_layers(layer)
+        
+        # Filter subset based on pruning_last flag
+        filtered_subset = {}
+        for name in subset:
+            if should_prune_module(args, i, total_layers, name):
+                filtered_subset[name] = subset[name]
+            elif args.pruning_last is not None:
+                print(f"Skipping layer {i} module {name} (not in last {args.pruning_last} MLP layers)")
+        
+        # Skip layer entirely if no modules to prune
+        if not filtered_subset:
+            continue
+            
+        subset = filtered_subset
 
         if f"model.layers.{i}" in model.hf_device_map:   ## handle the case for llama-30B and llama-65B, when the device map has multiple GPUs;
             dev = model.hf_device_map[f"model.layers.{i}"]
@@ -262,6 +326,8 @@ def prune_neuronrank_unstructured(args, model, tokenizer, device=torch.device("c
     magnitude_scale = float(args.magnitude_multi)
 
     layers = model.model.layers
+    total_layers = len(layers)
+    
     for i, layer in enumerate(layers):
         subset = find_layers(layer)
         layer_entry = scores.get(i)
@@ -270,6 +336,12 @@ def prune_neuronrank_unstructured(args, model, tokenizer, device=torch.device("c
             layer_variance = layer_entry.get("variance")
 
         for name, module in subset.items():
+            # Check pruning_last flag first
+            if not should_prune_module(args, i, total_layers, name):
+                if args.pruning_last is not None:
+                    print(f"Skipping layer {i} module {name} (not in last {args.pruning_last} MLP layers)")
+                continue
+                
             if not args.nr_include_attention and "mlp" not in name:
                 continue
 
@@ -349,12 +421,20 @@ def prune_wanda_idf(args, model, tokenizer, device=torch.device("cuda:0"), prune
     stats = collect_wanda_selectivity_stats(model, dataloader, device, quantile=0.9)
     
     layers = model.model.layers
+    total_layers = len(layers)
+    
     for i in range(len(layers)):
         layer = layers[i]
         subset = find_layers(layer)
         layer_stats = stats.get(i, {})
 
         for name in subset:
+            # Check if we should prune this module based on pruning_last flag
+            if not should_prune_module(args, i, total_layers, name):
+                if args.pruning_last is not None:
+                    print(f"Skipping layer {i} module {name} (not in last {args.pruning_last} MLP layers)")
+                continue
+                
             print(f"pruning layer {i} name {name}")
             W = subset[name].weight.data
             module_stats = layer_stats.get(name)
@@ -398,12 +478,19 @@ def prune_wanda_spiky(args, model, tokenizer, device=torch.device("cuda:0"), pru
     stats = collect_wanda_selectivity_stats(model, dataloader, device, quantile=0.9)
     
     layers = model.model.layers
+    total_layers = len(layers)
     for i in range(len(layers)):
         layer = layers[i]
         subset = find_layers(layer)
         layer_stats = stats.get(i, {})
 
         for name in subset:
+            # Check if we should prune this module based on pruning_last flag
+            if not should_prune_module(args, i, total_layers, name):
+                if args.pruning_last is not None:
+                    print(f"Skipping layer {i} module {name} (not in last {args.pruning_last} MLP layers)")
+                continue
+                
             print(f"pruning layer {i} name {name}")
             W = subset[name].weight.data
             module_stats = layer_stats.get(name)
@@ -447,12 +534,20 @@ def prune_wanda_selective(args, model, tokenizer, device=torch.device("cuda:0"),
     stats = collect_wanda_selectivity_stats(model, dataloader, device, quantile=0.9)
     
     layers = model.model.layers
+    total_layers = len(layers)
+    
     for i in range(len(layers)):
         layer = layers[i]
         subset = find_layers(layer)
         layer_stats = stats.get(i, {})
 
         for name in subset:
+            # Check if we should prune this module based on pruning_last flag
+            if not should_prune_module(args, i, total_layers, name):
+                if args.pruning_last is not None:
+                    print(f"Skipping layer {i} module {name} (not in last {args.pruning_last} MLP layers)")
+                continue
+                
             print(f"pruning layer {i} name {name}")
             W = subset[name].weight.data
             module_stats = layer_stats.get(name)
@@ -529,6 +624,8 @@ def prune_sparsegpt(args, model, tokenizer, dev, prune_n=0, prune_m=0):
 
     print('Ready.')
 
+    total_layers = len(layers)
+    
     for i in range(len(layers)):
         layer = layers[i]
         if f"model.layers.{i}" in model.hf_device_map:
@@ -537,6 +634,20 @@ def prune_sparsegpt(args, model, tokenizer, dev, prune_n=0, prune_m=0):
             inps, outs, attention_mask, position_ids = inps.to(dev), outs.to(dev), attention_mask.to(dev), position_ids.to(dev)
 
         subset = find_layers(layer)
+        
+        # Filter subset based on pruning_last flag
+        filtered_subset = {}
+        for name in subset:
+            if should_prune_module(args, i, total_layers, name):
+                filtered_subset[name] = subset[name]
+            elif args.pruning_last is not None:
+                print(f"Skipping layer {i} module {name} (not in last {args.pruning_last} MLP layers)")
+        
+        # Skip layer entirely if no modules to prune
+        if not filtered_subset:
+            continue
+            
+        subset = filtered_subset
 
         gpts = {}
         for name in subset:
@@ -620,6 +731,8 @@ def prune_ablate(args, model, tokenizer, dev, prune_n=0, prune_m=0):
 
     print('Ready.')
 
+    total_layers = len(layers)
+    
     for i in range(len(layers)):
         layer = layers[i]
         if f"model.layers.{i}" in model.hf_device_map:
@@ -628,6 +741,20 @@ def prune_ablate(args, model, tokenizer, dev, prune_n=0, prune_m=0):
             inps, outs, attention_mask, position_ids = inps.to(dev), outs.to(dev), attention_mask.to(dev), position_ids.to(dev)
 
         subset = find_layers(layer)
+        
+        # Filter subset based on pruning_last flag
+        filtered_subset = {}
+        for name in subset:
+            if should_prune_module(args, i, total_layers, name):
+                filtered_subset[name] = subset[name]
+            elif args.pruning_last is not None:
+                print(f"Skipping layer {i} module {name} (not in last {args.pruning_last} MLP layers)")
+        
+        # Skip layer entirely if no modules to prune
+        if not filtered_subset:
+            continue
+            
+        subset = filtered_subset
 
         gpts = {}
         for name in subset:

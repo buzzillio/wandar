@@ -196,6 +196,8 @@ def main():
     parser.set_defaults(nr_include_attention=True)
     parser.add_argument('--nr-prune-lm-head', action='store_true',
                         help='Also prune the LM head using magnitude when running NeuronRank unstructured pruning.')
+    parser.add_argument('--pruning_last', type=int, default=None,
+                        help='Only prune the last X MLP blocks of the model. If specified, only MLP layers in the last X transformer layers will be pruned (no attention layers).')
 
     parser.add_argument("--eval_zero_shot", action="store_true")
     args = parser.parse_args()
@@ -248,6 +250,12 @@ def main():
 
     if args.sparsity_ratio != 0:
         print("pruning starts")
+        if args.pruning_last is not None:
+            total_layers = len(model.model.layers)
+            print(f"🎯 Pruning mode: LAST {args.pruning_last} MLP layers only (layers {total_layers - args.pruning_last} to {total_layers - 1})")
+            print(f"🎯 Total layers in model: {total_layers}")
+        else:
+            print("🎯 Pruning mode: ALL layers")
         if args.prune_method == "wanda":
             prune_wanda(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m)
         elif args.prune_method == "magnitude":
