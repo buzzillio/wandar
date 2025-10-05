@@ -17,7 +17,7 @@ class RunningStats:
     def update(self, batch: torch.Tensor):
         if batch is None or batch.numel() == 0:
             return
-        batch = batch.to(self.dtype)
+        batch = batch.to(device=self.device, dtype=self.dtype)
         batch_count = batch.shape[0]
         if batch_count == 0:
             return
