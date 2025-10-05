@@ -201,6 +201,11 @@ def prune_magnitude(args, model, tokenizer, device=torch.device("cuda:0"), prune
                     W_mask = (W_metric <= thresh)
 
             W[W_mask] = 0
+    
+    # Clean up memory after pruning
+    torch.cuda.empty_cache()
+    import gc
+    gc.collect()
 
 def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0, prune_m=0):
     use_cache = model.config.use_cache 

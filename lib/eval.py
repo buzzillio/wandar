@@ -119,6 +119,11 @@ def eval_ppl_wikitext(model, testenc, bs=1, device=None):
 
         # Append to list of negative log likelihoods
         nlls.append(neg_log_likelihood)
+        
+        # Clean up intermediate tensors to free memory
+        del lm_logits, shift_logits, shift_labels, loss, inputs
+        if i % 10 == 0:  # Clear cache every 10 batches
+            torch.cuda.empty_cache()
 
     # Compute perplexity
     ppl = torch.exp(torch.stack(nlls).sum() / (nsamples * model.seqlen))

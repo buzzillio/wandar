@@ -294,6 +294,13 @@ def main():
     print(f"sparsity sanity check {sparsity_ratio:.4f}")
     print("*"*30)
     ################################################################
+    
+    # Clean up memory before evaluation
+    print("Cleaning up memory before evaluation...")
+    torch.cuda.empty_cache()
+    import gc
+    gc.collect()
+    
     ppl_test = eval_ppl(args, model, tokenizer, device)
     print(f"wikitext perplexity {ppl_test}")
     
