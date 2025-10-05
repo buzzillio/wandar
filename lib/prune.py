@@ -88,15 +88,35 @@ def check_sparsity(model):
         sub_params = 0
         for name in subset:
             W = subset[name].weight.data
-            count += (W==0).sum().item()
-            total_params += W.numel()
+            
+            # Handle meta tensors by moving to concrete device if needed
+            if W.device.type == 'meta':
+                # Skip meta tensors or try to get actual device from hf_device_map
+                if hasattr(model, 'hf_device_map') and f"model.layers.{i}" in model.hf_device_map:
+                    device = model.hf_device_map[f"model.layers.{i}"]
+                    W = subset[name].weight.to(device).data
+                else:
+                    # Skip this layer if we can't resolve device
+                    print(f"Warning: Skipping layer {i} {name} (meta tensor, device unknown)")
+                    continue
+            
+            zero_count = (W == 0).sum().item()
+            param_count = W.numel()
+            
+            count += zero_count
+            total_params += param_count
+            sub_count += zero_count
+            sub_params += param_count
 
-            sub_count += (W==0).sum().item()
-            sub_params += W.numel()
-
-        print(f"layer {i} sparsity {float(sub_count)/sub_params:.6f}")
+        if sub_params > 0:
+            print(f"layer {i} sparsity {float(sub_count)/sub_params:.6f}")
 
     model.config.use_cache = use_cache 
+    
+    if total_params == 0:
+        print("Warning: No parameters found, returning 0 sparsity")
+        return 0.0
+    
     return float(count)/total_params 
 
 def prepare_calibration_input(model, dataloader, device):
