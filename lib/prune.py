@@ -89,19 +89,18 @@ def check_sparsity(model):
         for name in subset:
             W = subset[name].weight.data
             
-            # Handle meta tensors by moving to concrete device if needed
+            # Handle meta tensors - skip them as they have no actual data
             if W.device.type == 'meta':
-                # Skip meta tensors or try to get actual device from hf_device_map
-                if hasattr(model, 'hf_device_map') and f"model.layers.{i}" in model.hf_device_map:
-                    device = model.hf_device_map[f"model.layers.{i}"]
-                    W = subset[name].weight.to(device).data
-                else:
-                    # Skip this layer if we can't resolve device
-                    print(f"Warning: Skipping layer {i} {name} (meta tensor, device unknown)")
-                    continue
+                print(f"Warning: Skipping layer {i} {name} (meta tensor)")
+                continue
             
-            zero_count = (W == 0).sum().item()
-            param_count = W.numel()
+            # Move to CPU if needed to avoid device issues
+            if W.device.type == 'cuda':
+                zero_count = (W == 0).sum().cpu().item()
+                param_count = W.numel()
+            else:
+                zero_count = (W == 0).sum().item()
+                param_count = W.numel()
             
             count += zero_count
             total_params += param_count
