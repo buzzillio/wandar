@@ -1,14 +1,63 @@
 import argparse
 import os 
+import warnings
+import importlib.util
+import subprocess
+import sys
+
+# Check if torch is installed with proper CUDA support
+if importlib.util.find_spec("torch") is None:
+    print("⚙️ Installing PyTorch (CUDA 12.4 build)...")
+    subprocess.check_call([
+        sys.executable, "-m", "pip", "install",
+        "--index-url", "https://download.pytorch.org/whl/cu124",
+        "torch", "torchvision", "torchaudio"
+    ])
+
 import numpy as np
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from importlib.metadata import version
 
-from lib.prune import (prune_wanda, prune_magnitude, prune_sparsegpt, prune_ablate, 
-                       prune_wanda_idf, prune_wanda_spiky, prune_wanda_select,
-                       check_sparsity, find_layers)
+print("✅ PyTorch imported successfully:", torch.__version__)
+if torch.cuda.is_available():
+    print("GPU:", torch.cuda.get_device_name(0), "CUDA", torch.version.cuda)
+else:
+    print("⚠️ CUDA not available, using CPU")
+
+warnings.filterwarnings(
+    "ignore",
+    message="You are using `torch.load` with `weights_only=False`",
+)
+warnings.filterwarnings(
+    "ignore",
+    message=".*CUDA capabilities.*",
+)
+warnings.filterwarnings(
+    "ignore",
+    category=UserWarning,
+    message=".*GPU with PyTorch.*",
+)
+
+from lib.data import get_loaders
+from lib.prune import (
+    prune_wanda,
+    prune_magnitude,
+    prune_sparsegpt,
+    prune_ablate,
+    prune_neuronrank_unstructured,
+    prune_wanda_idf,
+    prune_wanda_spiky,
+    prune_wanda_selective,
+    check_sparsity,
+)
 from lib.eval import eval_ppl, eval_zero_shot
+from lib.neuronrank import (
+    collect_neuronrank_statistics,
+    compute_neuronrank_scores,
+    compute_neuronrank_class_scores,
+    apply_neuronrank_pruning,
+)
 
 print('torch', version('torch'))
 print('transformers', version('transformers'))
@@ -27,6 +76,79 @@ def get_llm(model_name, cache_dir="llm_weights"):
     model.seqlen = model.config.max_position_embeddings 
     return model
 
+
+def prune_neuronrank(args, model, tokenizer, device):
+    if args.sparsity_type != "unstructured":
+        raise ValueError("NeuronRank pruning currently only supports unstructured sparsity type.")
+
+    use_cache = model.config.use_cache
+    model.config.use_cache = False
+
+    dataloader, _ = get_loaders(
+        "c4",
+        nsamples=args.nsamples,
+        seed=args.seed,
+        seqlen=model.seqlen,
+        tokenizer=tokenizer,
+    )
+    print("collecting NeuronRank statistics")
+    stats = collect_neuronrank_statistics(
+        model,
+        dataloader,
+        tokenizer,
+        device,
+        max_classes=args.neuronrank_max_classes,
+    )
+    scores = compute_neuronrank_scores(
+        model,
+        stats,
+        token_weight=args.neuronrank_token_weight,
+        variance_exp=args.variance_exp,
+        variance_multi=args.variance_multi,
+        magnitude_multi=args.magnitude_multi,
+    )
+    pruned, total = apply_neuronrank_pruning(model, scores, args.sparsity_ratio)
+    model.config.use_cache = use_cache
+
+    pct = 100.0 * pruned / total if total else 0.0
+    print(f"NeuronRank pruned {pruned}/{total} channels across MLPs ({pct:.2f}% structural sparsity)")
+
+
+def prune_neuronrank_variance(args, model, tokenizer, device):
+    if args.sparsity_type != "unstructured":
+        raise ValueError("NeuronRank variance-only pruning currently only supports unstructured sparsity type.")
+    if args.neuronrank_max_classes <= 0:
+        raise ValueError("NeuronRank variance-only pruning requires --neuronrank-max-classes > 0 to collect token-class statistics.")
+
+    use_cache = model.config.use_cache
+    model.config.use_cache = False
+
+    dataloader, _ = get_loaders(
+        "c4",
+        nsamples=args.nsamples,
+        seed=args.seed,
+        seqlen=model.seqlen,
+        tokenizer=tokenizer,
+    )
+    print("collecting NeuronRank class variance statistics")
+    stats = collect_neuronrank_statistics(
+        model,
+        dataloader,
+        tokenizer,
+        device,
+        max_classes=args.neuronrank_max_classes,
+    )
+    scores = compute_neuronrank_class_scores(stats)
+    if not scores:
+        raise RuntimeError("NeuronRank variance-only pruning could not compute class variance scores (no classes collected).")
+
+    pruned, total = apply_neuronrank_pruning(model, scores, args.sparsity_ratio)
+    model.config.use_cache = use_cache
+
+    pct = 100.0 * pruned / total if total else 0.0
+    print(f"NeuronRank variance-only pruned {pruned}/{total} channels across MLPs ({pct:.2f}% structural sparsity)")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--model', type=str, help='LLaMA model')
@@ -35,15 +157,68 @@ def main():
     parser.add_argument('--sparsity_ratio', type=float, default=0, help='Sparsity level')
     parser.add_argument("--sparsity_type", type=str, choices=["unstructured", "4:8", "2:4"])
     parser.add_argument("--prune_method", type=str, choices=["magnitude", "wanda", "sparsegpt", 
-                        "ablate_mag_seq", "ablate_wanda_seq", "ablate_mag_iter", "ablate_wanda_iter", "search",
-                        "wanda_idf", "wanda_spiky", "wanda_select"])
+                        "ablate_mag_seq", "ablate_wanda_seq", "ablate_mag_iter", "ablate_wanda_iter", "search", 
+                        "neuronrank", "neuronrank_unstructured", "neuronrank_variance",
+                        "wanda_idf", "wanda_spiky", "wanda_selective"])
     parser.add_argument("--cache_dir", default="llm_weights", type=str )
     parser.add_argument('--use_variant', action="store_true", help="whether to use the wanda variant described in the appendix")
     parser.add_argument('--save', type=str, default=None, help='Path to save results.')
     parser.add_argument('--save_model', type=str, default=None, help='Path to save the pruned model.')
+    parser.add_argument('--neuronrank_token_weight', type=float, default=0.0,
+                        help='Additional weight for token-level variance when computing NeuronRank scores (0 disables token variance contribution).')
+    parser.add_argument('--variance-exp', dest='variance_exp', type=float, default=1.0,
+                        help='Exponent applied to the variance term (alpha in variance^alpha).')
+    parser.add_argument('--variance-multi', dest='variance_multi', type=float, default=1.0,
+                        help='Multiplier applied to the variance term after exponentiation (beta).')
+    parser.add_argument('--magnitude-multi', dest='magnitude_multi', type=float, default=0.0,
+                        help='Multiplier applied to the weight magnitude term (gamma). Set to 1 for pure magnitude pruning.')
+    parser.add_argument('--magnitude-base', dest='legacy_magnitude_base', type=float, default=None,
+                        help='[Deprecated] Alias; will be removed in a future release.')
+    parser.add_argument('--magnitude-exp', dest='legacy_magnitude_exp', type=float, default=None,
+                        help='[Deprecated] Alias; will be removed in a future release.')
+    parser.add_argument('--discrimination-multi', dest='legacy_discrimination_multi', type=float, default=None,
+                        help='[Deprecated] Alias; will be removed in a future release.')
+    parser.add_argument('--discrimination-exp', dest='legacy_discrimination_exp', type=float, default=None,
+                        help='[Deprecated] Alias; will be removed in a future release.')
+    parser.add_argument('--nr-discrimination-weight', dest='nr_discrimination_weight', type=float, default=None,
+                        help='[Deprecated] Alias; will be removed in a future release.')
+    parser.add_argument('--neuronrank-max-classes', type=int, default=512,
+                        help='Maximum number of high-frequency token classes to track when computing NeuronRank statistics (0 disables class-aware variance).')
+    parser.add_argument('--nr-include-attention', dest='nr_include_attention', action='store_true',
+                        help='When using NeuronRank unstructured pruning, also prune attention projection weights (default).')
+    parser.add_argument('--nr-skip-attention', dest='nr_include_attention', action='store_false',
+                        help='Skip pruning attention projection weights in NeuronRank unstructured mode.')
+    parser.set_defaults(nr_include_attention=True)
+    parser.add_argument('--nr-prune-lm-head', action='store_true',
+                        help='Also prune the LM head using magnitude when running NeuronRank unstructured pruning.')
 
     parser.add_argument("--eval_zero_shot", action="store_true")
     args = parser.parse_args()
+
+    if getattr(args, "nr_discrimination_weight", None) is not None:
+        if args.variance_exp == parser.get_default("variance_exp"):
+            args.variance_exp = args.nr_discrimination_weight
+        print("[Warning] --nr-discrimination-weight is deprecated; please use --variance-exp instead.")
+
+    if getattr(args, "legacy_discrimination_multi", None) is not None:
+        if args.variance_exp == parser.get_default("variance_exp"):
+            args.variance_exp = args.legacy_discrimination_multi
+        print("[Warning] --discrimination-multi is deprecated; please use --variance-exp instead.")
+
+    if getattr(args, "legacy_discrimination_exp", None) is not None:
+        if args.variance_multi == parser.get_default("variance_multi"):
+            args.variance_multi = args.legacy_discrimination_exp
+        print("[Warning] --discrimination-exp is deprecated; please use --variance-multi instead.")
+
+    if getattr(args, "legacy_magnitude_base", None) is not None:
+        if args.magnitude_multi == parser.get_default("magnitude_multi"):
+            args.magnitude_multi = args.legacy_magnitude_base
+        print("[Warning] --magnitude-base is deprecated; please use --magnitude-multi instead.")
+
+    if getattr(args, "legacy_magnitude_exp", None) is not None:
+        if args.magnitude_multi == parser.get_default("magnitude_multi"):
+            args.magnitude_multi = args.legacy_magnitude_exp
+        print("[Warning] --magnitude-exp is deprecated; please use --magnitude-multi instead.")
 
     # Setting seeds for reproducibility
     np.random.seed(args.seed)
@@ -70,18 +245,24 @@ def main():
         print("pruning starts")
         if args.prune_method == "wanda":
             prune_wanda(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m)
-        elif args.prune_method == "wanda_idf":
-            prune_wanda_idf(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m)
-        elif args.prune_method == "wanda_spiky":
-            prune_wanda_spiky(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m)
-        elif args.prune_method == "wanda_select":
-            prune_wanda_select(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m)
         elif args.prune_method == "magnitude":
             prune_magnitude(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m)
         elif args.prune_method == "sparsegpt":
             prune_sparsegpt(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m)
         elif "ablate" in args.prune_method:
             prune_ablate(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m)
+        elif args.prune_method == "neuronrank":
+            prune_neuronrank(args, model, tokenizer, device)
+        elif args.prune_method == "neuronrank_unstructured":
+            prune_neuronrank_unstructured(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m)
+        elif args.prune_method == "neuronrank_variance":
+            prune_neuronrank_variance(args, model, tokenizer, device)
+        elif args.prune_method == "wanda_idf":
+            prune_wanda_idf(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m)
+        elif args.prune_method == "wanda_spiky":
+            prune_wanda_spiky(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m)
+        elif args.prune_method == "wanda_selective":
+            prune_wanda_selective(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m)
 
     ################################################################
     print("*"*30)
@@ -92,13 +273,12 @@ def main():
     ppl_test = eval_ppl(args, model, tokenizer, device)
     print(f"wikitext perplexity {ppl_test}")
 
-    if args.save:
-        if not os.path.exists(args.save):
-            os.makedirs(args.save)
-        save_filepath = os.path.join(args.save, f"log_{args.prune_method}.txt")
-        with open(save_filepath, "w") as f:
-            print("method\tactual_sparsity\tppl_test", file=f, flush=True)
-            print(f"{args.prune_method}\t{sparsity_ratio:.4f}\t{ppl_test:.4f}", file=f, flush=True)
+    if not os.path.exists(args.save):
+        os.makedirs(args.save)
+    save_filepath = os.path.join(args.save, f"log_{args.prune_method}.txt")
+    with open(save_filepath, "w") as f:
+        print("method\tactual_sparsity\tppl_test", file=f, flush=True)
+        print(f"{args.prune_method}\t{sparsity_ratio:.4f}\t{ppl_test:.4f}", file=f, flush=True)
 
     if args.eval_zero_shot:
         accelerate=False

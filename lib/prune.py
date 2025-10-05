@@ -3,14 +3,12 @@ import heapq
 import torch 
 import torch.nn as nn 
 from .sparsegpt import SparseGPT 
-from .layerwrapper import WrappedGPT, WrappedGPTSelectivity
+from .layerwrapper import WrappedGPT
 from .data import get_loaders 
+from .neuronrank import collect_neuronrank_statistics, compute_neuronrank_scores
+from .wanda_selectivity import collect_wanda_selectivity_stats
 
-from .ablate import AblateGPT
-
-__all__ = ['prune_wanda', 'prune_magnitude', 'prune_sparsegpt', 'prune_ablate', 
-           'prune_wanda_idf', 'prune_wanda_spiky', 'prune_wanda_select',
-           'check_sparsity', 'find_layers'] 
+from .ablate import AblateGPT 
 
 def find_layers(module, layers=[nn.Linear], name=''):
     """
@@ -214,294 +212,268 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
     torch.cuda.empty_cache()
 
 
+def prune_neuronrank_unstructured(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0, prune_m=0):
+    if prune_n != 0 or prune_m != 0:
+        raise ValueError("NeuronRank unstructured pruning does not support N:M sparsity.")
+
+    def _apply_unstructured_mask(weight_tensor, metric_tensor, ratio):
+        numel = metric_tensor.numel()
+        num_to_prune = int(numel * ratio)
+        if num_to_prune <= 0:
+            return 0, numel
+
+        flat_metric = metric_tensor.flatten()
+        if metric_tensor.device.type == 'cuda':
+            flat_metric = flat_metric.cuda()
+        threshold_idx = min(num_to_prune, flat_metric.numel() - 1)
+        threshold = torch.sort(flat_metric)[0][threshold_idx]
+        if metric_tensor.device.type == 'cpu':
+            threshold = threshold.cpu()
+        mask = metric_tensor <= threshold
+        weight_tensor[mask] = 0
+        return mask.sum().item(), numel
+
+    use_cache = model.config.use_cache
+    model.config.use_cache = False
+
+    dataloader, _ = get_loaders(
+        "c4",
+        nsamples=args.nsamples,
+        seed=args.seed,
+        seqlen=model.seqlen,
+        tokenizer=tokenizer,
+    )
+
+    stats = collect_neuronrank_statistics(
+        model,
+        dataloader,
+        tokenizer,
+        device,
+        max_classes=args.neuronrank_max_classes,
+    )
+    scores = compute_neuronrank_scores(
+        model,
+        stats,
+        token_weight=args.neuronrank_token_weight,
+        variance_exp=args.variance_exp,
+        variance_multi=args.variance_multi,
+        magnitude_multi=args.magnitude_multi,
+    )
+
+    total_pruned = 0
+    total_weights = 0
+
+    magnitude_scale = float(args.magnitude_multi)
+
+    layers = model.model.layers
+    for i, layer in enumerate(layers):
+        subset = find_layers(layer)
+        layer_entry = scores.get(i)
+        layer_variance = None
+        if isinstance(layer_entry, dict):
+            layer_variance = layer_entry.get("variance")
+
+        for name, module in subset.items():
+            if not args.nr_include_attention and "mlp" not in name:
+                continue
+
+            weight = module.weight.data
+            if args.sparsity_ratio <= 0:
+                continue
+
+            metric = torch.abs(weight) * magnitude_scale
+
+            if (
+                layer_variance is not None
+                and "mlp" in name
+            ):
+                variance_vec = layer_variance.to(metric.device, dtype=metric.dtype)
+                
+                if args.variance_exp == 0.0:
+                    variance_term = torch.ones_like(variance_vec)
+                elif args.variance_exp == 1.0:
+                    variance_term = variance_vec
+                else:
+                    variance_term = torch.pow(variance_vec.clamp(min=1e-12), args.variance_exp)
+                
+                variance_component = variance_term * args.variance_multi
+                
+                if "gate_proj" in name or "up_proj" in name:
+                    addition = variance_component.view(-1, 1)
+                elif "down_proj" in name:
+                    addition = variance_component.view(1, -1)
+                else:
+                    addition = None
+                if addition is not None:
+                    metric = metric + addition
+
+            pruned, numel = _apply_unstructured_mask(weight, metric, args.sparsity_ratio)
+            total_pruned += pruned
+            total_weights += numel
+
+            print(f"[NeuronRank-Unstructured] layer {i} name {name} pruned {pruned} / {numel}")
+
+    if args.nr_prune_lm_head and hasattr(model, "lm_head") and isinstance(model.lm_head, nn.Linear):
+        weight = model.lm_head.weight.data
+        metric = torch.abs(weight)
+        pruned, numel = _apply_unstructured_mask(weight, metric, args.sparsity_ratio)
+        total_pruned += pruned
+        total_weights += numel
+        print(f"[NeuronRank-Unstructured] lm_head pruned {pruned} / {numel}")
+
+    model.config.use_cache = use_cache
+    torch.cuda.empty_cache()
+
+    if total_weights:
+        pct = 100.0 * total_pruned / total_weights
+        print(f"[NeuronRank-Unstructured] global pruning ratio {pct:.2f}% ({total_pruned}/{total_weights})")
+
+
 def prune_wanda_idf(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0, prune_m=0):
-    """
-    Wanda pruning enhanced with IDF-style rarity metric.
-    Score: S_ij = |W_ij| * ||X_j||_2 * IDF_j
-    where IDF_j = log(1 / p_j) penalizes always-on channels.
-    """
-    use_cache = model.config.use_cache 
-    model.config.use_cache = False 
+    """Wanda × IDF: S_ij = |W_ij| * ||X_j||_2 * log(1/p_j)"""
+    use_cache = model.config.use_cache
+    model.config.use_cache = False
 
     print("loading calibration data")
     dataloader, _ = get_loaders("c4", nsamples=args.nsamples, seed=args.seed, seqlen=model.seqlen, tokenizer=tokenizer)
-    print("dataset loading complete")
-    with torch.no_grad():
-        inps, outs, attention_mask, position_ids = prepare_calibration_input(model, dataloader, device)
-
+    print("collecting Wanda + IDF stats")
+    
+    stats = collect_wanda_selectivity_stats(model, dataloader, device, quantile=0.9)
+    
     layers = model.model.layers
     for i in range(len(layers)):
         layer = layers[i]
         subset = find_layers(layer)
-
-        if f"model.layers.{i}" in model.hf_device_map:
-            dev = model.hf_device_map[f"model.layers.{i}"]
-            inps, outs, attention_mask, position_ids = inps.to(dev), outs.to(dev), attention_mask.to(dev), position_ids.to(dev)
-
-        wrapped_layers = {}
-        for name in subset:
-            wrapped_layers[name] = WrappedGPTSelectivity(subset[name])
-
-        def add_batch(name):
-            def tmp(_, inp, out):
-                wrapped_layers[name].add_batch(inp[0].data, out.data)
-            return tmp
-
-        handles = []
-        for name in wrapped_layers:
-            handles.append(subset[name].register_forward_hook(add_batch(name)))
-        for j in range(args.nsamples):
-            with torch.no_grad():
-                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
-        for h in handles:
-            h.remove()
+        layer_stats = stats.get(i, {})
 
         for name in subset:
             print(f"pruning layer {i} name {name}")
+            W = subset[name].weight.data
+            module_stats = layer_stats.get(name)
             
-            # Finalize metrics
-            idf_scores, _ = wrapped_layers[name].finalize_metrics()
-            
-            # Wanda × IDF score
-            W_metric = torch.abs(subset[name].weight.data) * torch.sqrt(wrapped_layers[name].scaler_row.reshape((1,-1))) * idf_scores.reshape((1,-1))
+            if module_stats is None:
+                W_metric = torch.abs(W)
+            else:
+                input_norm = module_stats['input_norm'].to(W.device, dtype=W.dtype)
+                idf = module_stats['idf'].to(W.device, dtype=W.dtype)
+                
+                # Wanda × IDF
+                scale = input_norm * idf
+                W_metric = torch.abs(W) * scale.reshape((1, -1))
 
-            W_mask = (torch.zeros_like(W_metric) == 1)
+            W_mask = torch.zeros_like(W, dtype=torch.bool)
             if prune_n != 0:
-                # structured n:m sparsity
                 for ii in range(W_metric.shape[1]):
                     if ii % prune_m == 0:
-                        tmp = W_metric[:,ii:(ii+prune_m)].float()
-                        W_mask.scatter_(1, ii+torch.topk(tmp, prune_n, dim=1, largest=False)[1], True)
+                        tmp = W_metric[:, ii:(ii+prune_m)].float()
+                        W_mask.scatter_(1, ii + torch.topk(tmp, prune_n, dim=1, largest=False)[1], True)
             else:
                 sort_res = torch.sort(W_metric, dim=-1, stable=True)
+                indices = sort_res[1][:, :int(W_metric.shape[1] * args.sparsity_ratio)]
+                W_mask.scatter_(1, indices, True)
 
-                if args.use_variant:
-                    # wanda variant 
-                    tmp_metric = torch.cumsum(sort_res[0], dim=1)
-                    sum_before = W_metric.sum(dim=1)
+            W[W_mask] = 0
 
-                    alpha = 0.4
-                    alpha_hist = [0., 0.8]
-                    W_mask, cur_sparsity = return_given_alpha(alpha, sort_res, W_metric, tmp_metric, sum_before)
-                    while (torch.abs(cur_sparsity - args.sparsity_ratio)>0.001) and (alpha_hist[1]-alpha_hist[0]>=0.001):
-                        if cur_sparsity > args.sparsity_ratio:
-                            alpha_new = (alpha + alpha_hist[0]) / 2.0
-                            alpha_hist[1] = alpha
-                        else:
-                            alpha_new = (alpha + alpha_hist[1]) / 2.0
-                            alpha_hist[0] = alpha
-
-                        alpha = alpha_new 
-                        W_mask, cur_sparsity = return_given_alpha(alpha, sort_res, W_metric, tmp_metric, sum_before)
-                    print(f"alpha found {alpha} sparsity {cur_sparsity:.6f}")
-                else:
-                    # unstructured pruning
-                    indices = sort_res[1][:,:int(W_metric.shape[1]*args.sparsity_ratio)]
-                    W_mask.scatter_(1, indices, True)
-
-            subset[name].weight.data[W_mask] = 0
-
-        for j in range(args.nsamples):
-            with torch.no_grad():
-                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
-        inps, outs = outs, inps
-
-    model.config.use_cache = use_cache 
+    model.config.use_cache = use_cache
     torch.cuda.empty_cache()
 
 
 def prune_wanda_spiky(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0, prune_m=0):
-    """
-    Wanda pruning enhanced with spikiness metric.
-    Score: S_ij = |W_ij| * ||X_j||_2 * R_j
-    where R_j = mu_top / mu rewards peaky specialists.
-    """
-    use_cache = model.config.use_cache 
-    model.config.use_cache = False 
+    """Wanda × Spikiness: S_ij = |W_ij| * ||X_j||_2 * (mu_top / mu)"""
+    use_cache = model.config.use_cache
+    model.config.use_cache = False
 
     print("loading calibration data")
     dataloader, _ = get_loaders("c4", nsamples=args.nsamples, seed=args.seed, seqlen=model.seqlen, tokenizer=tokenizer)
-    print("dataset loading complete")
-    with torch.no_grad():
-        inps, outs, attention_mask, position_ids = prepare_calibration_input(model, dataloader, device)
-
+    print("collecting Wanda + Spikiness stats")
+    
+    stats = collect_wanda_selectivity_stats(model, dataloader, device, quantile=0.9)
+    
     layers = model.model.layers
     for i in range(len(layers)):
         layer = layers[i]
         subset = find_layers(layer)
-
-        if f"model.layers.{i}" in model.hf_device_map:
-            dev = model.hf_device_map[f"model.layers.{i}"]
-            inps, outs, attention_mask, position_ids = inps.to(dev), outs.to(dev), attention_mask.to(dev), position_ids.to(dev)
-
-        wrapped_layers = {}
-        for name in subset:
-            wrapped_layers[name] = WrappedGPTSelectivity(subset[name])
-
-        def add_batch(name):
-            def tmp(_, inp, out):
-                wrapped_layers[name].add_batch(inp[0].data, out.data)
-            return tmp
-
-        handles = []
-        for name in wrapped_layers:
-            handles.append(subset[name].register_forward_hook(add_batch(name)))
-        for j in range(args.nsamples):
-            with torch.no_grad():
-                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
-        for h in handles:
-            h.remove()
+        layer_stats = stats.get(i, {})
 
         for name in subset:
             print(f"pruning layer {i} name {name}")
+            W = subset[name].weight.data
+            module_stats = layer_stats.get(name)
             
-            # Finalize metrics
-            _, spiky_scores = wrapped_layers[name].finalize_metrics()
-            
-            # Wanda × spikiness score
-            W_metric = torch.abs(subset[name].weight.data) * torch.sqrt(wrapped_layers[name].scaler_row.reshape((1,-1))) * spiky_scores.reshape((1,-1))
+            if module_stats is None:
+                W_metric = torch.abs(W)
+            else:
+                input_norm = module_stats['input_norm'].to(W.device, dtype=W.dtype)
+                spikiness = module_stats['spikiness'].to(W.device, dtype=W.dtype)
+                
+                # Wanda × Spikiness
+                scale = input_norm * spikiness
+                W_metric = torch.abs(W) * scale.reshape((1, -1))
 
-            W_mask = (torch.zeros_like(W_metric) == 1)
+            W_mask = torch.zeros_like(W, dtype=torch.bool)
             if prune_n != 0:
-                # structured n:m sparsity
                 for ii in range(W_metric.shape[1]):
                     if ii % prune_m == 0:
-                        tmp = W_metric[:,ii:(ii+prune_m)].float()
-                        W_mask.scatter_(1, ii+torch.topk(tmp, prune_n, dim=1, largest=False)[1], True)
+                        tmp = W_metric[:, ii:(ii+prune_m)].float()
+                        W_mask.scatter_(1, ii + torch.topk(tmp, prune_n, dim=1, largest=False)[1], True)
             else:
                 sort_res = torch.sort(W_metric, dim=-1, stable=True)
+                indices = sort_res[1][:, :int(W_metric.shape[1] * args.sparsity_ratio)]
+                W_mask.scatter_(1, indices, True)
 
-                if args.use_variant:
-                    # wanda variant 
-                    tmp_metric = torch.cumsum(sort_res[0], dim=1)
-                    sum_before = W_metric.sum(dim=1)
+            W[W_mask] = 0
 
-                    alpha = 0.4
-                    alpha_hist = [0., 0.8]
-                    W_mask, cur_sparsity = return_given_alpha(alpha, sort_res, W_metric, tmp_metric, sum_before)
-                    while (torch.abs(cur_sparsity - args.sparsity_ratio)>0.001) and (alpha_hist[1]-alpha_hist[0]>=0.001):
-                        if cur_sparsity > args.sparsity_ratio:
-                            alpha_new = (alpha + alpha_hist[0]) / 2.0
-                            alpha_hist[1] = alpha
-                        else:
-                            alpha_new = (alpha + alpha_hist[1]) / 2.0
-                            alpha_hist[0] = alpha
-
-                        alpha = alpha_new 
-                        W_mask, cur_sparsity = return_given_alpha(alpha, sort_res, W_metric, tmp_metric, sum_before)
-                    print(f"alpha found {alpha} sparsity {cur_sparsity:.6f}")
-                else:
-                    # unstructured pruning
-                    indices = sort_res[1][:,:int(W_metric.shape[1]*args.sparsity_ratio)]
-                    W_mask.scatter_(1, indices, True)
-
-            subset[name].weight.data[W_mask] = 0
-
-        for j in range(args.nsamples):
-            with torch.no_grad():
-                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
-        inps, outs = outs, inps
-
-    model.config.use_cache = use_cache 
+    model.config.use_cache = use_cache
     torch.cuda.empty_cache()
 
 
-def prune_wanda_select(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0, prune_m=0):
-    """
-    Wanda pruning enhanced with both IDF and spikiness metrics.
-    Score: S_ij = |W_ij| * ||X_j||_2 * IDF_j * R_j
-    Combined selectivity: penalizes always-on and rewards specialists.
-    """
-    use_cache = model.config.use_cache 
-    model.config.use_cache = False 
+def prune_wanda_selective(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0, prune_m=0):
+    """Wanda × IDF × Spikiness: S_ij = |W_ij| * ||X_j||_2 * log(1/p_j) * (mu_top / mu)"""
+    use_cache = model.config.use_cache
+    model.config.use_cache = False
 
     print("loading calibration data")
     dataloader, _ = get_loaders("c4", nsamples=args.nsamples, seed=args.seed, seqlen=model.seqlen, tokenizer=tokenizer)
-    print("dataset loading complete")
-    with torch.no_grad():
-        inps, outs, attention_mask, position_ids = prepare_calibration_input(model, dataloader, device)
-
+    print("collecting Wanda + Selectivity stats")
+    
+    stats = collect_wanda_selectivity_stats(model, dataloader, device, quantile=0.9)
+    
     layers = model.model.layers
     for i in range(len(layers)):
         layer = layers[i]
         subset = find_layers(layer)
-
-        if f"model.layers.{i}" in model.hf_device_map:
-            dev = model.hf_device_map[f"model.layers.{i}"]
-            inps, outs, attention_mask, position_ids = inps.to(dev), outs.to(dev), attention_mask.to(dev), position_ids.to(dev)
-
-        wrapped_layers = {}
-        for name in subset:
-            wrapped_layers[name] = WrappedGPTSelectivity(subset[name])
-
-        def add_batch(name):
-            def tmp(_, inp, out):
-                wrapped_layers[name].add_batch(inp[0].data, out.data)
-            return tmp
-
-        handles = []
-        for name in wrapped_layers:
-            handles.append(subset[name].register_forward_hook(add_batch(name)))
-        for j in range(args.nsamples):
-            with torch.no_grad():
-                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
-        for h in handles:
-            h.remove()
+        layer_stats = stats.get(i, {})
 
         for name in subset:
             print(f"pruning layer {i} name {name}")
+            W = subset[name].weight.data
+            module_stats = layer_stats.get(name)
             
-            # Finalize metrics
-            idf_scores, spiky_scores = wrapped_layers[name].finalize_metrics()
-            
-            # Wanda × IDF × spikiness score (full selectivity)
-            W_metric = (torch.abs(subset[name].weight.data) * 
-                       torch.sqrt(wrapped_layers[name].scaler_row.reshape((1,-1))) * 
-                       idf_scores.reshape((1,-1)) * 
-                       spiky_scores.reshape((1,-1)))
+            if module_stats is None:
+                W_metric = torch.abs(W)
+            else:
+                input_norm = module_stats['input_norm'].to(W.device, dtype=W.dtype)
+                idf = module_stats['idf'].to(W.device, dtype=W.dtype)
+                spikiness = module_stats['spikiness'].to(W.device, dtype=W.dtype)
+                
+                # Wanda × IDF × Spikiness
+                scale = input_norm * idf * spikiness
+                W_metric = torch.abs(W) * scale.reshape((1, -1))
 
-            W_mask = (torch.zeros_like(W_metric) == 1)
+            W_mask = torch.zeros_like(W, dtype=torch.bool)
             if prune_n != 0:
-                # structured n:m sparsity
                 for ii in range(W_metric.shape[1]):
                     if ii % prune_m == 0:
-                        tmp = W_metric[:,ii:(ii+prune_m)].float()
-                        W_mask.scatter_(1, ii+torch.topk(tmp, prune_n, dim=1, largest=False)[1], True)
+                        tmp = W_metric[:, ii:(ii+prune_m)].float()
+                        W_mask.scatter_(1, ii + torch.topk(tmp, prune_n, dim=1, largest=False)[1], True)
             else:
                 sort_res = torch.sort(W_metric, dim=-1, stable=True)
+                indices = sort_res[1][:, :int(W_metric.shape[1] * args.sparsity_ratio)]
+                W_mask.scatter_(1, indices, True)
 
-                if args.use_variant:
-                    # wanda variant 
-                    tmp_metric = torch.cumsum(sort_res[0], dim=1)
-                    sum_before = W_metric.sum(dim=1)
+            W[W_mask] = 0
 
-                    alpha = 0.4
-                    alpha_hist = [0., 0.8]
-                    W_mask, cur_sparsity = return_given_alpha(alpha, sort_res, W_metric, tmp_metric, sum_before)
-                    while (torch.abs(cur_sparsity - args.sparsity_ratio)>0.001) and (alpha_hist[1]-alpha_hist[0]>=0.001):
-                        if cur_sparsity > args.sparsity_ratio:
-                            alpha_new = (alpha + alpha_hist[0]) / 2.0
-                            alpha_hist[1] = alpha
-                        else:
-                            alpha_new = (alpha + alpha_hist[1]) / 2.0
-                            alpha_hist[0] = alpha
-
-                        alpha = alpha_new 
-                        W_mask, cur_sparsity = return_given_alpha(alpha, sort_res, W_metric, tmp_metric, sum_before)
-                    print(f"alpha found {alpha} sparsity {cur_sparsity:.6f}")
-                else:
-                    # unstructured pruning
-                    indices = sort_res[1][:,:int(W_metric.shape[1]*args.sparsity_ratio)]
-                    W_mask.scatter_(1, indices, True)
-
-            subset[name].weight.data[W_mask] = 0
-
-        for j in range(args.nsamples):
-            with torch.no_grad():
-                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
-        inps, outs = outs, inps
-
-    model.config.use_cache = use_cache 
+    model.config.use_cache = use_cache
     torch.cuda.empty_cache()
 
 

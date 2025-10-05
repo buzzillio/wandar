@@ -14,7 +14,7 @@ Carnegie Mellon University, Meta AI Research and Bosch Center for AI  <br>
   journal={arXiv preprint arXiv:2306.11695}
 }
 ```
-
+ 
 --- 
 <p align="center">
 <img src="https://user-images.githubusercontent.com/20168304/273351964-53c3807e-3453-49c5-b855-b620b1026466.png" width=100% height=100% 
@@ -40,7 +40,7 @@ The [scripts](scripts) directory contains all the bash commands to replicate the
 Below is an example command for pruning LLaMA-7B with Wanda, to achieve unstructured 50% sparsity.
 ```sh
 python main.py \
-    --model baffo32/decapoda-research/llama-7b-hf \
+    --model decapoda-research/llama-7b-hf \
     --prune_method wanda \
     --sparsity_ratio 0.5 \
     --sparsity_type unstructured \
