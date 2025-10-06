@@ -1188,6 +1188,12 @@ def prune_hybrid(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=
                     tf = tf.to(W.device)
                     idf = idf.to(W.device)
                     
+                    # Debug first layer
+                    if i == 0:
+                        print(f"  [DEBUG] Layer {i} {name}: tf shape={tf.shape}, range=[{tf.min():.6f}, {tf.max():.6f}]")
+                        print(f"  [DEBUG] Layer {i} {name}: idf shape={idf.shape}, range=[{idf.min():.6f}, {idf.max():.6f}]")
+                        print(f"  [DEBUG] Layer {i} {name}: W shape={W.shape}")
+                    
                     # Compute TF-IDF metric
                     metric = compute_tfidf_scores(
                         weight=W,
@@ -1199,6 +1205,10 @@ def prune_hybrid(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=
                         gamma=args.idf_exp,
                         rho=args.nr_spikiness_exp,
                     )
+                    
+                    # Debug metric
+                    if i == 0:
+                        print(f"  [DEBUG] Layer {i} {name}: metric shape={metric.shape}, range=[{metric.min():.6f}, {metric.max():.6f}], nonzero={torch.count_nonzero(metric).item()}")
                 
                 elif args.hybrid_mlp_method == 'neuronrank_old':
                     # Get neuron scores for this layer
