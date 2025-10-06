@@ -241,6 +241,12 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
     use_cache = model.config.use_cache 
     model.config.use_cache = False 
 
+    # Get Wanda hyperparameters
+    w_alpha = getattr(args, 'w_alpha', 1.0)
+    w_beta = getattr(args, 'w_beta', 1.0)
+    print(f"🎯 Wanda hyperparameters: α={w_alpha} (weight), β={w_beta} (activation)")
+    print(f"   Formula: Score = |W|^{w_alpha} × |X|^{w_beta}")
+
     print("loading calibdation data")
     dataloader, _ = get_loaders("c4",nsamples=args.nsamples,seed=args.seed,seqlen=model.seqlen,tokenizer=tokenizer)
     print("dataset loading complete")
@@ -295,7 +301,14 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
             print(f"pruning layer {i} name {name}")
             weight = subset[name].weight.data
             scaler = torch.sqrt(wrapped_layers[name].scaler_row.reshape((1, -1))).to(weight.device, dtype=torch.float32)
-            W_metric = torch.abs(weight).to(torch.float32) * scaler
+            
+            # Apply Wanda hyperparameters: |W|^α × |X|^β
+            w_alpha = getattr(args, 'w_alpha', 1.0)
+            w_beta = getattr(args, 'w_beta', 1.0)
+            
+            weight_term = torch.pow(torch.abs(weight).to(torch.float32).clamp(min=1e-12), w_alpha)
+            activation_term = torch.pow(scaler.clamp(min=1e-12), w_beta)
+            W_metric = weight_term * activation_term
 
             W_mask = None
             if prune_n != 0:

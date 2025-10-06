@@ -240,6 +240,12 @@ def main():
                         choices=['neuronrank_tfidf', 'neuronrank_old'], default='neuronrank_tfidf',
                         help='MLP pruning method for hybrid mode: neuronrank_tfidf (default) or neuronrank_old')
 
+    # Wanda hyperparameters
+    parser.add_argument('--w-alpha', dest='w_alpha', type=float, default=1.0,
+                        help='Exponent α for weight magnitude in Wanda: |W|^α × |X|^β (default: 1.0)')
+    parser.add_argument('--w-beta', dest='w_beta', type=float, default=1.0,
+                        help='Exponent β for activation magnitude in Wanda: |W|^α × |X|^β (default: 1.0)')
+
     parser.add_argument("--eval_zero_shot", action="store_true")
     args = parser.parse_args()
 
