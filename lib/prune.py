@@ -691,6 +691,8 @@ def prune_neuronrank_tfidf(args, model, tokenizer, device, prune_n=0, prune_m=0)
             h = layer.mlp.gate_proj.register_forward_hook(make_hook(i, 'mlp.gate_proj'))
             handles.append(h)
     
+    print(f"✅ Registered {len(handles)} forward hooks")
+    
     # Run calibration data through model
     model.eval()
     for batch_idx, batch in enumerate(dataloader):
@@ -717,6 +719,10 @@ def prune_neuronrank_tfidf(args, model, tokenizer, device, prune_n=0, prune_m=0)
         tfidf_stats = stats_collector.finalize()
     
     print(f"✅ Collected TF-IDF statistics for {len(tfidf_stats)} modules")
+    if len(tfidf_stats) > 0:
+        print(f"   Sample keys: {list(tfidf_stats.keys())[:3]}")
+    else:
+        print(f"   ⚠️  WARNING: No statistics collected! Check hooks and data flow.")
     
     # Prune each layer
     print(f"✂️  Applying TF-IDF++ pruning (α={args.weight_exp}, β={args.tf_exp}, γ={args.idf_exp})...")
@@ -724,16 +730,22 @@ def prune_neuronrank_tfidf(args, model, tokenizer, device, prune_n=0, prune_m=0)
     total_pruned = 0
     total_weights = 0
     
+    skipped_no_stats = 0
+    skipped_not_mlp = 0
+    skipped_should_not_prune = 0
+    
     for i in range(total_layers):
         layer = layers[i]
         subset = find_layers(layer)
         
         for name in subset:
             if not should_prune_module(args, i, total_layers, name):
+                skipped_should_not_prune += 1
                 continue
             
             # Only prune MLP modules (we only collected stats for gate_proj)
             if 'mlp' not in name:
+                skipped_not_mlp += 1
                 continue
             
             # Get weight tensor
@@ -742,7 +754,9 @@ def prune_neuronrank_tfidf(args, model, tokenizer, device, prune_n=0, prune_m=0)
             
             # Check if we have TF-IDF stats for this layer
             if layer_key not in tfidf_stats:
-                print(f"  Warning: No TF-IDF statistics for {layer_key}, skipping layer {i}")
+                if i < 3:  # Only print for first few layers to avoid spam
+                    print(f"  Warning: No TF-IDF statistics for {layer_key}, skipping layer {i}")
+                skipped_no_stats += 1
                 continue
             
             tf, idf = tfidf_stats[layer_key]
@@ -786,6 +800,7 @@ def prune_neuronrank_tfidf(args, model, tokenizer, device, prune_n=0, prune_m=0)
         print(f"🎯 NeuronRank TF-IDF++ ({args.nr_tfidf_mode}): pruned {total_pruned}/{total_weights} weights ({actual_sparsity:.2%} sparsity)")
     else:
         print(f"⚠️  Warning: No weights were pruned!")
+        print(f"   Debug: skipped_should_not_prune={skipped_should_not_prune}, skipped_not_mlp={skipped_not_mlp}, skipped_no_stats={skipped_no_stats}")
     
     # Clean up
     torch.cuda.empty_cache()
