@@ -1030,30 +1030,46 @@ def prune_hybrid(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=
     elif args.hybrid_mlp_method == 'neuronrank_old':
         # Use neuronrank_old statistics collection
         from lib.neuronrank import TFIDFStats, compute_neuronrank_old_scores
+        import torch.nn.functional as F
         
-        stats_collector = TFIDFStats(device=device, dtype=torch.float32)
+        # Create per-layer statistics collectors
+        layer_stats = {}
         mlp_handles = []
         
-        def make_mlp_hook_old(layer_idx):
-            def hook(module, input, output):
-                if isinstance(output, tuple):
-                    acts = output[0]
-                else:
-                    acts = output
+        # Register hooks for each layer's gate_proj
+        for layer_idx, layer in enumerate(layers):
+            gate_proj = getattr(layer.mlp, "gate_proj", None)
+            if gate_proj is None:
+                continue
+
+            layer_device = gate_proj.weight.device
+            layer_dtype = torch.float32
+
+            layer_stats[layer_idx] = TFIDFStats(
+                size=gate_proj.out_features,
+                dtype=layer_dtype,
+                device=layer_device
+            )
+
+            def make_hook(idx):
+                def hook(_module, _inputs, output):
+                    if output is None:
+                        return
+                    # Apply SiLU activation
+                    act = F.silu(output)
+                    
+                    # Flatten to [num_tokens, neuron_dim]
+                    if act.dim() == 3:
+                        act_flat = act.flatten(0, 1)  # [batch*seq_len, neuron_dim]
+                    else:
+                        act_flat = act
+                    
+                    # Update TF-IDF statistics
+                    layer_stats[idx].update(act_flat)
                 
-                if acts.dim() == 3:
-                    B, T, C = acts.shape
-                    acts = acts.reshape(B * T, C)
-                
-                layer_key = f"layer_{layer_idx}"
-                stats_collector.update(layer_key, acts)
-            
-            return hook
-        
-        for i, layer in enumerate(layers):
-            if hasattr(layer, 'mlp') and hasattr(layer.mlp, 'gate_proj'):
-                h = layer.mlp.gate_proj.register_forward_hook(make_mlp_hook_old(i))
-                mlp_handles.append(h)
+                return hook
+
+            mlp_handles.append(gate_proj.register_forward_hook(make_hook(layer_idx)))
         
         print(f"✅ Registered {len(mlp_handles)} MLP hooks")
         
@@ -1067,8 +1083,19 @@ def prune_hybrid(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=
         for h in mlp_handles:
             h.remove()
         
-        # Finalize statistics
-        mlp_stats = stats_collector.finalize()
+        # Compute final TF and IDF scores
+        mlp_stats = {}
+        for idx, tfidf_stats in layer_stats.items():
+            tf, idf = tfidf_stats.compute_tf_idf()
+            mlp_stats[idx] = {
+                "tf": tf.to(dtype=torch.float32, device="cpu"),
+                "idf": idf.to(dtype=torch.float32, device="cpu"),
+                "total_tokens": tfidf_stats.total_tokens,
+            }
+            print(f"  Layer {idx}: TF range [{tf.min():.6f}, {tf.max():.6f}], "
+                  f"IDF range [{idf.min():.6f}, {idf.max():.6f}], "
+                  f"tokens={tfidf_stats.total_tokens}")
+        
         print(f"✅ Collected NeuronRank-OLD statistics for {len(mlp_stats)} MLP modules")
     
     # ========================================
@@ -1163,28 +1190,48 @@ def prune_hybrid(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=
                     )
                 
                 elif args.hybrid_mlp_method == 'neuronrank_old':
-                    layer_key = f"layer_{i}"
+                    # Get neuron scores for this layer
+                    layer_stats_dict = mlp_stats.get(i)
                     
-                    if layer_key not in mlp_stats:
+                    if layer_stats_dict is None:
+                        mlp_skipped_no_stats += 1
                         continue
                     
-                    tf, idf, spikiness = mlp_stats[layer_key]
-                    tf = tf.to(W.device)
-                    idf = idf.to(W.device)
-                    spikiness = spikiness.to(W.device) if spikiness is not None else None
+                    # Extract TF and IDF
+                    tf = layer_stats_dict["tf"].to(W.device, dtype=torch.float32)
+                    idf = layer_stats_dict["idf"].to(W.device, dtype=torch.float32)
                     
-                    # Compute NeuronRank-OLD metric
-                    from lib.neuronrank import compute_neuronrank_old_scores
-                    metric = compute_neuronrank_old_scores(
-                        weight=W,
-                        name=name,
-                        tf=tf,
-                        idf=idf,
-                        spikiness=spikiness,
-                        alpha=args.weight_exp,
-                        beta=args.tf_exp,
-                        gamma=args.idf_exp,
-                    )
+                    # Compute neuron scores: |W|^α × TF^β × IDF^γ
+                    # For gate_proj: weight shape is [intermediate_size, hidden_size]
+                    # We need per-neuron (output) scores
+                    if "gate_proj" in name or "up_proj" in name:
+                        # Column projection: weight shape [out_features, in_features]
+                        # Compute weight magnitude per output neuron (L2 norm across input dim)
+                        weight_magnitude = torch.norm(W, p=2, dim=1)
+                    elif "down_proj" in name:
+                        # Row projection: weight shape [out_features, in_features]
+                        # Compute weight magnitude per input neuron (L2 norm across output dim)
+                        weight_magnitude = torch.norm(W, p=2, dim=0)
+                    else:
+                        # Fallback
+                        weight_magnitude = torch.abs(W)
+                    
+                    # Apply exponents
+                    weight_term = torch.pow(weight_magnitude.clamp(min=1e-12), args.weight_exp)
+                    tf_term = torch.pow(tf.clamp(min=1e-12), args.tf_exp)
+                    idf_term = torch.pow(idf.clamp(min=1e-12), args.idf_exp)
+                    
+                    # Compute neuron scores
+                    neuron_scores = weight_term * tf_term * idf_term
+                    
+                    # Broadcast to weight matrix
+                    abs_weight = torch.abs(W).to(torch.float32)
+                    if "gate_proj" in name or "up_proj" in name:
+                        metric = abs_weight * neuron_scores.view(-1, 1)
+                    elif "down_proj" in name:
+                        metric = abs_weight * neuron_scores.view(1, -1)
+                    else:
+                        metric = abs_weight
                 
                 # Sanitize
                 metric = torch.nan_to_num(metric, nan=0.0, posinf=0.0, neginf=0.0)
