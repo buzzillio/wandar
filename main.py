@@ -52,6 +52,7 @@ from lib.prune import (
     prune_neuronrank_unstructured,
     prune_neuronrank_old,
     prune_neuronrank_tfidf,
+    prune_hybrid,
     prune_wanda_idf,
     prune_wanda_spiky,
     prune_wanda_selective,
@@ -179,7 +180,7 @@ def main():
     parser.add_argument("--prune_method", type=str, choices=["magnitude", "wanda", "sparsegpt", 
                         "ablate_mag_seq", "ablate_wanda_seq", "ablate_mag_iter", "ablate_wanda_iter", "search", 
                         "neuronrank", "neuronrank_unstructured", "neuronrank_variance", "neuronrank_old",
-                        "neuronrank_tfidf",
+                        "neuronrank_tfidf", "hybrid",
                         "wanda_idf", "wanda_spiky", "wanda_selective"])
     parser.add_argument("--cache_dir", default="llm_weights", type=str )
     parser.add_argument('--use_variant', action="store_true", help="whether to use the wanda variant described in the appendix")
@@ -233,6 +234,11 @@ def main():
                         help='Quantile threshold for considering a neuron "active" in a doc/topic')
     parser.add_argument('--nr-spikiness-exp', dest='nr_spikiness_exp', type=float, default=0.0,
                         help='Exponent ρ for optional spikiness multiplier in TF-IDF scoring')
+
+    # Hybrid pruning arguments
+    parser.add_argument('--hybrid-mlp-method', dest='hybrid_mlp_method', type=str,
+                        choices=['neuronrank_tfidf', 'neuronrank_old'], default='neuronrank_tfidf',
+                        help='MLP pruning method for hybrid mode: neuronrank_tfidf (default) or neuronrank_old')
 
     parser.add_argument("--eval_zero_shot", action="store_true")
     args = parser.parse_args()
@@ -309,6 +315,8 @@ def main():
             prune_neuronrank_old(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m)
         elif args.prune_method == "neuronrank_tfidf":
             prune_neuronrank_tfidf(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m)
+        elif args.prune_method == "hybrid":
+            prune_hybrid(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m)
         elif args.prune_method == "wanda_idf":
             prune_wanda_idf(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m)
         elif args.prune_method == "wanda_spiky":

@@ -860,6 +860,354 @@ def prune_neuronrank_tfidf(args, model, tokenizer, device, prune_n=0, prune_m=0)
     gc.collect()
 
 
+def prune_hybrid(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0, prune_m=0):
+    """
+    Hybrid pruning: Wanda for attention, NeuronRank (TF-IDF or OLD) for MLPs.
+    
+    This method combines the strengths of different pruning approaches:
+    - Wanda for attention layers (magnitude × activation)
+    - NeuronRank TF-IDF/OLD for MLP layers (semantic selectivity)
+    """
+    if prune_n != 0 or prune_m != 0:
+        raise ValueError("Hybrid pruning does not support N:M sparsity.")
+    
+    use_cache = model.config.use_cache
+    model.config.use_cache = False
+    
+    print("=" * 60)
+    print("🔀 HYBRID PRUNING MODE")
+    print("=" * 60)
+    print(f"  Attention: Wanda (magnitude × activation)")
+    print(f"  MLP:       {args.hybrid_mlp_method}")
+    print("=" * 60)
+    
+    # Load calibration data (shared for both methods)
+    print("📂 Loading calibration data...")
+    dataloader, _ = get_loaders(
+        "c4",
+        nsamples=args.nsamples,
+        seed=args.seed,
+        seqlen=model.seqlen,
+        tokenizer=tokenizer,
+    )
+    
+    layers = model.model.layers
+    total_layers = len(layers)
+    
+    # ========================================
+    # PART 1: Collect Wanda statistics for ATTENTION
+    # ========================================
+    print("\n" + "=" * 60)
+    print("🎯 PART 1: Wanda Statistics for Attention Layers")
+    print("=" * 60)
+    
+    from .layerwrapper import WrappedGPT
+    
+    wrapped_layers = {}
+    for i in range(len(layers)):
+        layer = layers[i]
+        subset = find_layers(layer)
+        wrapped_layers[i] = {}
+        
+        for name in subset:
+            # Only wrap attention modules for Wanda
+            if 'self_attn' in name:
+                wrapped_layers[i][name] = WrappedGPT(subset[name])
+    
+    def add_batch(name):
+        def tmp(_, inp, out):
+            wrapped_layers[name[0]][name[1]].add_batch(inp[0].data, out.data)
+        return tmp
+    
+    handles = []
+    for i in range(len(layers)):
+        layer = layers[i]
+        subset = find_layers(layer)
+        for name in subset:
+            if 'self_attn' in name:
+                handles.append(subset[name].register_forward_hook(add_batch((i, name))))
+    
+    # Run calibration through model for Wanda
+    for j, batch in enumerate(dataloader):
+        with torch.no_grad():
+            model(batch[0].to(device))
+        if (j + 1) % 10 == 0:
+            print(f"  Processed {j + 1}/{len(dataloader)} batches for Wanda")
+    
+    for h in handles:
+        h.remove()
+    
+    print(f"✅ Collected Wanda statistics for attention layers")
+    
+    # ========================================
+    # PART 2: Collect NeuronRank statistics for MLPs
+    # ========================================
+    print("\n" + "=" * 60)
+    print(f"🧠 PART 2: {args.hybrid_mlp_method.upper()} Statistics for MLP Layers")
+    print("=" * 60)
+    
+    mlp_stats = {}
+    
+    if args.hybrid_mlp_method == 'neuronrank_tfidf':
+        # Use TF-IDF++ statistics collection
+        from lib.neuronrank import DocTFIDFStats, TopicTFIDFStats, compute_tfidf_scores
+        
+        # Initialize statistics collector
+        if args.nr_tfidf_mode == 'topic':
+            print(f"📊 Using topic-level TF-IDF with {args.nr_tfidf_k} topics")
+            stats_collector = TopicTFIDFStats(
+                device=device,
+                dtype=torch.float32,
+                k_topics=args.nr_tfidf_k,
+                proj_dim=128,
+                q_active=args.nr_q_active,
+            )
+        else:
+            print(f"📊 Using document-level TF-IDF")
+            stats_collector = DocTFIDFStats(
+                device=device,
+                dtype=torch.float32,
+                q_active=args.nr_q_active,
+            )
+        
+        # Register hooks for MLP gate_proj
+        mlp_handles = []
+        
+        def make_mlp_hook(layer_idx, module_name):
+            def hook(module, input, output):
+                if isinstance(output, tuple):
+                    acts = output[0]
+                else:
+                    acts = output
+                
+                if acts.dim() == 3:
+                    acts = acts.reshape(-1, acts.size(-1))
+                
+                layer_key = f"layer_{layer_idx}.{module_name}"
+                
+                if args.nr_tfidf_mode == 'topic':
+                    stats_collector.update_doc_with_topics(layer_key, acts)
+                else:
+                    stats_collector.update_doc(layer_key, acts)
+            
+            return hook
+        
+        for i, layer in enumerate(layers):
+            if hasattr(layer, 'mlp') and hasattr(layer.mlp, 'gate_proj'):
+                h = layer.mlp.gate_proj.register_forward_hook(make_mlp_hook(i, 'mlp.gate_proj'))
+                mlp_handles.append(h)
+        
+        print(f"✅ Registered {len(mlp_handles)} MLP hooks")
+        
+        # Run calibration through model for TF-IDF
+        for j, batch in enumerate(dataloader):
+            with torch.no_grad():
+                model(batch[0].to(device))
+            if (j + 1) % 10 == 0:
+                print(f"  Processed {j + 1}/{len(dataloader)} batches for TF-IDF")
+        
+        for h in mlp_handles:
+            h.remove()
+        
+        # Finalize TF-IDF statistics
+        if args.nr_tfidf_mode == 'topic':
+            mlp_stats = stats_collector.finalize_topics()
+        else:
+            mlp_stats = stats_collector.finalize()
+        
+        print(f"✅ Collected TF-IDF statistics for {len(mlp_stats)} MLP modules")
+    
+    elif args.hybrid_mlp_method == 'neuronrank_old':
+        # Use neuronrank_old statistics collection
+        from lib.neuronrank import TFIDFStats, compute_neuronrank_old_scores
+        
+        stats_collector = TFIDFStats(device=device, dtype=torch.float32)
+        mlp_handles = []
+        
+        def make_mlp_hook_old(layer_idx):
+            def hook(module, input, output):
+                if isinstance(output, tuple):
+                    acts = output[0]
+                else:
+                    acts = output
+                
+                if acts.dim() == 3:
+                    B, T, C = acts.shape
+                    acts = acts.reshape(B * T, C)
+                
+                layer_key = f"layer_{layer_idx}"
+                stats_collector.update(layer_key, acts)
+            
+            return hook
+        
+        for i, layer in enumerate(layers):
+            if hasattr(layer, 'mlp') and hasattr(layer.mlp, 'gate_proj'):
+                h = layer.mlp.gate_proj.register_forward_hook(make_mlp_hook_old(i))
+                mlp_handles.append(h)
+        
+        print(f"✅ Registered {len(mlp_handles)} MLP hooks")
+        
+        # Run calibration through model
+        for j, batch in enumerate(dataloader):
+            with torch.no_grad():
+                model(batch[0].to(device))
+            if (j + 1) % 10 == 0:
+                print(f"  Processed {j + 1}/{len(dataloader)} batches for NeuronRank-OLD")
+        
+        for h in mlp_handles:
+            h.remove()
+        
+        # Finalize statistics
+        mlp_stats = stats_collector.finalize()
+        print(f"✅ Collected NeuronRank-OLD statistics for {len(mlp_stats)} MLP modules")
+    
+    # ========================================
+    # PART 3: Apply pruning
+    # ========================================
+    print("\n" + "=" * 60)
+    print("✂️  PART 3: Applying Hybrid Pruning")
+    print("=" * 60)
+    
+    total_pruned = 0
+    total_weights = 0
+    attn_pruned = 0
+    attn_weights = 0
+    mlp_pruned = 0
+    mlp_weights = 0
+    
+    for i in range(total_layers):
+        layer = layers[i]
+        subset = find_layers(layer)
+        
+        for name in subset:
+            if not should_prune_module(args, i, total_layers, name):
+                continue
+            
+            W = subset[name].weight.data
+            is_attention = 'self_attn' in name
+            is_mlp = 'mlp' in name
+            
+            if not is_attention and not is_mlp:
+                continue
+            
+            # ===== ATTENTION: Use Wanda =====
+            if is_attention:
+                wrapped = wrapped_layers[i].get(name)
+                if wrapped is None:
+                    continue
+                
+                # Compute Wanda metric
+                W_metric = torch.abs(W)
+                activation_metric = torch.sqrt(wrapped.scaler_row.reshape((1, -1)))
+                metric = W_metric * activation_metric
+                
+                # Sanitize
+                metric = torch.nan_to_num(metric, nan=0.0, posinf=0.0, neginf=0.0)
+                
+                if torch.count_nonzero(metric).item() == 0:
+                    continue
+                
+                pruned, numel = _apply_unstructured_mask(W, metric, args.sparsity_ratio)
+                attn_pruned += pruned
+                attn_weights += numel
+                
+                if i < 2 or i >= total_layers - 2:
+                    print(f"  [Wanda-Attn] layer {i:2d} {name:20s}: pruned {pruned:7d}/{numel:7d} weights")
+            
+            # ===== MLP: Use NeuronRank TF-IDF or OLD =====
+            elif is_mlp:
+                if args.hybrid_mlp_method == 'neuronrank_tfidf':
+                    layer_key = f"layer_{i}.mlp.gate_proj"
+                    
+                    if layer_key not in mlp_stats:
+                        continue
+                    
+                    tf, idf = mlp_stats[layer_key]
+                    tf = tf.to(W.device)
+                    idf = idf.to(W.device)
+                    
+                    # Compute TF-IDF metric
+                    metric = compute_tfidf_scores(
+                        weight=W,
+                        name=name,
+                        tf=tf,
+                        idf=idf,
+                        alpha=args.weight_exp,
+                        beta=args.tf_exp,
+                        gamma=args.idf_exp,
+                        rho=args.nr_spikiness_exp,
+                    )
+                
+                elif args.hybrid_mlp_method == 'neuronrank_old':
+                    layer_key = f"layer_{i}"
+                    
+                    if layer_key not in mlp_stats:
+                        continue
+                    
+                    tf, idf, spikiness = mlp_stats[layer_key]
+                    tf = tf.to(W.device)
+                    idf = idf.to(W.device)
+                    spikiness = spikiness.to(W.device) if spikiness is not None else None
+                    
+                    # Compute NeuronRank-OLD metric
+                    from lib.neuronrank import compute_neuronrank_old_scores
+                    metric = compute_neuronrank_old_scores(
+                        weight=W,
+                        name=name,
+                        tf=tf,
+                        idf=idf,
+                        spikiness=spikiness,
+                        alpha=args.weight_exp,
+                        beta=args.tf_exp,
+                        gamma=args.idf_exp,
+                    )
+                
+                # Sanitize
+                metric = torch.nan_to_num(metric, nan=0.0, posinf=0.0, neginf=0.0)
+                
+                if torch.count_nonzero(metric).item() == 0:
+                    continue
+                
+                pruned, numel = _apply_unstructured_mask(W, metric, args.sparsity_ratio)
+                mlp_pruned += pruned
+                mlp_weights += numel
+                
+                if i < 2 or i >= total_layers - 2:
+                    method_tag = "TFIDF" if args.hybrid_mlp_method == 'neuronrank_tfidf' else "OLD"
+                    print(f"  [NR-{method_tag}-MLP] layer {i:2d} {name:20s}: pruned {pruned:7d}/{numel:7d} weights")
+    
+    total_pruned = attn_pruned + mlp_pruned
+    total_weights = attn_weights + mlp_weights
+    
+    model.config.use_cache = use_cache
+    
+    # Print summary
+    print("\n" + "=" * 60)
+    print("📊 HYBRID PRUNING SUMMARY")
+    print("=" * 60)
+    
+    if attn_weights > 0:
+        attn_sparsity = attn_pruned / attn_weights
+        print(f"  Attention (Wanda):   {attn_pruned:,}/{attn_weights:,} weights ({attn_sparsity:.2%} sparsity)")
+    
+    if mlp_weights > 0:
+        mlp_sparsity = mlp_pruned / mlp_weights
+        print(f"  MLP ({args.hybrid_mlp_method}): {mlp_pruned:,}/{mlp_weights:,} weights ({mlp_sparsity:.2%} sparsity)")
+    
+    if total_weights > 0:
+        total_sparsity = total_pruned / total_weights
+        print(f"  TOTAL:               {total_pruned:,}/{total_weights:,} weights ({total_sparsity:.2%} sparsity)")
+    else:
+        print("  ⚠️  Warning: No weights were pruned!")
+    
+    print("=" * 60)
+    
+    # Clean up
+    torch.cuda.empty_cache()
+    import gc
+    gc.collect()
+
+
 def prune_wanda_idf(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0, prune_m=0):
     """Wanda × IDF: S_ij = |W_ij| * ||X_j||_2 * log(1/p_j)"""
     use_cache = model.config.use_cache
