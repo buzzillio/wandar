@@ -51,6 +51,7 @@ from lib.prune import (
     prune_ablate,
     prune_neuronrank_unstructured,
     prune_neuronrank_old,
+    prune_neuronrank_tfidf,
     prune_wanda_idf,
     prune_wanda_spiky,
     prune_wanda_selective,
@@ -178,6 +179,7 @@ def main():
     parser.add_argument("--prune_method", type=str, choices=["magnitude", "wanda", "sparsegpt", 
                         "ablate_mag_seq", "ablate_wanda_seq", "ablate_mag_iter", "ablate_wanda_iter", "search", 
                         "neuronrank", "neuronrank_unstructured", "neuronrank_variance", "neuronrank_old",
+                        "neuronrank_tfidf",
                         "wanda_idf", "wanda_spiky", "wanda_selective"])
     parser.add_argument("--cache_dir", default="llm_weights", type=str )
     parser.add_argument('--use_variant', action="store_true", help="whether to use the wanda variant described in the appendix")
@@ -220,6 +222,17 @@ def main():
                         help='Exponent β for Term Frequency (activation strength) in old NeuronRank formula')
     parser.add_argument('--idf-exp', dest='idf_exp', type=float, default=1.0,
                         help='Exponent γ for IDF (selectivity/sparsity) in old NeuronRank formula')
+
+    # NeuronRank TF-IDF++ arguments (doc/topic-level IDF)
+    parser.add_argument('--nr-tfidf-mode', dest='nr_tfidf_mode', type=str, 
+                        choices=['doc', 'topic'], default='doc',
+                        help='TF-IDF mode: "doc" for document-level IDF, "topic" for topic-clustered IDF')
+    parser.add_argument('--nr-tfidf-k', dest='nr_tfidf_k', type=int, default=64,
+                        help='Number of topics for topic-level TF-IDF (used when --nr-tfidf-mode=topic)')
+    parser.add_argument('--nr-q-active', dest='nr_q_active', type=float, default=0.60,
+                        help='Quantile threshold for considering a neuron "active" in a doc/topic')
+    parser.add_argument('--nr-spikiness-exp', dest='nr_spikiness_exp', type=float, default=0.0,
+                        help='Exponent ρ for optional spikiness multiplier in TF-IDF scoring')
 
     parser.add_argument("--eval_zero_shot", action="store_true")
     args = parser.parse_args()
@@ -294,6 +307,8 @@ def main():
             prune_neuronrank_variance(args, model, tokenizer, device)
         elif args.prune_method == "neuronrank_old":
             prune_neuronrank_old(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m)
+        elif args.prune_method == "neuronrank_tfidf":
+            prune_neuronrank_tfidf(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m)
         elif args.prune_method == "wanda_idf":
             prune_wanda_idf(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m)
         elif args.prune_method == "wanda_spiky":

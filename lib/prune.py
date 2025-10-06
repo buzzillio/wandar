@@ -617,6 +617,182 @@ def prune_neuronrank_old(args, model, tokenizer, device=torch.device("cuda:0"), 
         print(f"[NeuronRank-OLD] global pruning ratio {pct:.2f}% ({total_pruned}/{total_weights})")
 
 
+def prune_neuronrank_tfidf(args, model, tokenizer, device, prune_n=0, prune_m=0):
+    """
+    NeuronRank TF-IDF++ pruning with doc-level or topic-level IDF.
+    
+    Provides more sophisticated selectivity signals than token-level IDF by
+    treating calibration sequences as documents or clustering tokens into topics.
+    """
+    use_cache = model.config.use_cache
+    model.config.use_cache = False
+    
+    print(f"🔬 Loading calibration data for NeuronRank TF-IDF++ ({args.nr_tfidf_mode} mode)...")
+    dataloader, _ = get_loaders(
+        "c4",
+        nsamples=args.nsamples,
+        seed=args.seed,
+        seqlen=model.seqlen,
+        tokenizer=tokenizer,
+    )
+    
+    # Import the new TF-IDF stats classes
+    from lib.neuronrank import DocTFIDFStats, TopicTFIDFStats, compute_tfidf_scores
+    
+    # Initialize statistics collector
+    if args.nr_tfidf_mode == 'topic':
+        print(f"📊 Using topic-level TF-IDF with {args.nr_tfidf_k} topics")
+        stats_collector = TopicTFIDFStats(
+            device=device,
+            dtype=torch.float32,
+            k_topics=args.nr_tfidf_k,
+            proj_dim=128,
+            q_active=args.nr_q_active,
+        )
+    else:
+        print(f"📊 Using document-level TF-IDF")
+        stats_collector = DocTFIDFStats(
+            device=device,
+            dtype=torch.float32,
+            q_active=args.nr_q_active,
+        )
+    
+    # Collect activations
+    print("📈 Collecting TF-IDF statistics...")
+    layers = model.model.layers
+    
+    # Register hooks to collect activations
+    handles = []
+    
+    def make_hook(layer_idx, module_name):
+        def hook(module, input, output):
+            # Output is the activation tensor
+            if isinstance(output, tuple):
+                acts = output[0]
+            else:
+                acts = output
+            
+            # acts shape: [batch, seq_len, hidden_dim]
+            if acts.dim() == 3:
+                acts = acts.reshape(-1, acts.size(-1))  # [batch*seq_len, hidden_dim]
+            
+            layer_key = f"layer_{layer_idx}.{module_name}"
+            
+            if args.nr_tfidf_mode == 'topic':
+                stats_collector.update_doc_with_topics(layer_key, acts)
+            else:
+                stats_collector.update_doc(layer_key, acts)
+        
+        return hook
+    
+    # Register hooks on MLP gate_proj modules
+    for i, layer in enumerate(layers):
+        if hasattr(layer, 'mlp') and hasattr(layer.mlp, 'gate_proj'):
+            h = layer.mlp.gate_proj.register_forward_hook(make_hook(i, 'mlp.gate_proj'))
+            handles.append(h)
+    
+    # Run calibration data through model
+    model.eval()
+    for batch_idx, batch in enumerate(dataloader):
+        try:
+            inp = batch[0].to(device)
+            with torch.no_grad():
+                model(inp)
+            
+            if (batch_idx + 1) % 10 == 0:
+                print(f"  Processed {batch_idx + 1}/{len(dataloader)} calibration batches")
+        except Exception as e:
+            print(f"Warning: Error processing batch {batch_idx}: {e}")
+            continue
+    
+    # Remove hooks
+    for h in handles:
+        h.remove()
+    
+    # Finalize statistics
+    print("🧮 Finalizing TF-IDF statistics...")
+    if args.nr_tfidf_mode == 'topic':
+        tfidf_stats = stats_collector.finalize_topics()
+    else:
+        tfidf_stats = stats_collector.finalize()
+    
+    print(f"✅ Collected TF-IDF statistics for {len(tfidf_stats)} modules")
+    
+    # Prune each layer
+    print(f"✂️  Applying TF-IDF++ pruning (α={args.weight_exp}, β={args.tf_exp}, γ={args.idf_exp})...")
+    total_layers = len(layers)
+    total_pruned = 0
+    total_weights = 0
+    
+    for i in range(total_layers):
+        layer = layers[i]
+        subset = find_layers(layer)
+        
+        for name in subset:
+            if not should_prune_module(args, i, total_layers, name):
+                continue
+            
+            # Only prune MLP modules (we only collected stats for gate_proj)
+            if 'mlp' not in name:
+                continue
+            
+            # Get weight tensor
+            W = subset[name].weight.data
+            layer_key = f"layer_{i}.mlp.gate_proj"
+            
+            # Check if we have TF-IDF stats for this layer
+            if layer_key not in tfidf_stats:
+                print(f"  Warning: No TF-IDF statistics for {layer_key}, skipping layer {i}")
+                continue
+            
+            tf, idf = tfidf_stats[layer_key]
+            
+            # Move to weight's device
+            tf = tf.to(W.device)
+            idf = idf.to(W.device)
+            
+            # Compute per-weight scores using TF-IDF formula
+            metric = compute_tfidf_scores(
+                weight=W,
+                name=name,
+                tf=tf,
+                idf=idf,
+                alpha=args.weight_exp,
+                beta=args.tf_exp,
+                gamma=args.idf_exp,
+                rho=args.nr_spikiness_exp,
+            )
+            
+            # Sanitize metric
+            if not torch.isfinite(metric).all():
+                metric = torch.nan_to_num(metric, nan=0.0, posinf=0.0, neginf=0.0)
+            
+            if torch.count_nonzero(metric).item() == 0:
+                print(f"  Warning: All-zero metric for layer {i} {name}, skipping")
+                continue
+            
+            # Apply unstructured mask
+            pruned, numel = _apply_unstructured_mask(W, metric, args.sparsity_ratio)
+            total_pruned += pruned
+            total_weights += numel
+            
+            if i < 2 or i >= total_layers - 2:  # Print first 2 and last 2 layers
+                print(f"  [NeuronRank-TFIDF] layer {i:2d} {name:20s}: pruned {pruned:7d}/{numel:7d} weights")
+    
+    model.config.use_cache = use_cache
+    
+    if total_weights > 0:
+        actual_sparsity = total_pruned / total_weights
+        print(f"🎯 NeuronRank TF-IDF++ ({args.nr_tfidf_mode}): pruned {total_pruned}/{total_weights} weights ({actual_sparsity:.2%} sparsity)")
+    else:
+        print(f"⚠️  Warning: No weights were pruned!")
+    
+    # Clean up
+    torch.cuda.empty_cache()
+    import gc
+    gc.collect()
+
+
 def prune_wanda_idf(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0, prune_m=0):
     """Wanda × IDF: S_ij = |W_ij| * ||X_j||_2 * log(1/p_j)"""
     use_cache = model.config.use_cache

@@ -515,3 +515,256 @@ def compute_neuronrank_old_scores(
         print(f"Layer {layer_idx} scores: min={score.min():.6e}, max={score.max():.6e}, mean={score.mean():.6e}")
     
     return scores
+
+
+# ---------- Doc-level TF-IDF stats (NR-TFIDF++) ----------
+class DocTFIDFStats:
+    """Document-level TF-IDF statistics for neurons.
+    
+    Treats each calibration sequence as a 'document' and computes:
+    - TF: average |activation| across all tokens
+    - DF: number of documents where neuron is active (above threshold)
+    - IDF: log((N_docs + 1) / (DF + 1)) + 1
+    """
+    def __init__(self, device, dtype=torch.float32, q_active=0.60, eps=1e-12):
+        self.device = device
+        self.dtype = dtype
+        self.q_active = q_active  # Percentile threshold for "active"
+        self.eps = eps
+        self.doc_count = 0
+        self.channel_sum = {}      # layer_name -> [C] sum |act|
+        self.doc_active = {}       # layer_name -> [C] number of docs where channel active
+        self.doc_thresholds = {}   # layer_name -> [C] running q_active threshold estimate
+
+    def _ensure(self, key, C):
+        """Initialize tensors for a new layer."""
+        if key not in self.channel_sum:
+            self.channel_sum[key] = torch.zeros(C, device=self.device, dtype=self.dtype)
+            self.doc_active[key] = torch.zeros(C, device=self.device, dtype=torch.int32)
+            self.doc_thresholds[key] = torch.zeros(C, device=self.device, dtype=self.dtype)
+
+    @torch.no_grad()
+    def update_doc(self, layer_key: str, acts: torch.Tensor):
+        """Update statistics with activations from one document (sequence).
+        
+        Args:
+            layer_key: Layer identifier (e.g., "layer_5.mlp.gate_proj")
+            acts: Activation tensor [tokens, channels]
+        """
+        T, C = acts.shape
+        self._ensure(layer_key, C)
+        A = acts.abs().to(device=self.device, dtype=self.dtype)
+
+        # Per-channel active threshold from this doc (approximate quantile)
+        k = max(1, int(self.q_active * T))
+        thresh, _ = torch.kthvalue(A, k, dim=0)  # [C]
+        self.doc_thresholds[layer_key] += thresh
+
+        # TF: sum of activations across all tokens
+        self.channel_sum[layer_key] += A.sum(dim=0)
+        
+        # DF: count documents where channel is active at least once
+        active_mask = (A >= thresh.unsqueeze(0)).any(dim=0)
+        self.doc_active[layer_key] += active_mask.to(torch.int32)
+        
+        self.doc_count += 1
+
+    @torch.no_grad()
+    def finalize(self):
+        """Compute final TF and IDF tensors."""
+        results = {}
+        for key in self.channel_sum.keys():
+            # TF: mean activation over all tokens across docs
+            # Assume ~128 tokens/doc average
+            total_tokens = self.doc_count * 128
+            tf = self.channel_sum[key] / max(total_tokens, 1)
+            
+            # IDF: inverse document frequency
+            df = self.doc_active[key].to(torch.float32)
+            idf = torch.log((self.doc_count + 1.0) / (df + 1.0)) + 1.0
+            
+            # Sanitize
+            tf = torch.nan_to_num(tf, nan=0.0, posinf=0.0, neginf=0.0)
+            idf = torch.clamp(torch.nan_to_num(idf, nan=1.0), min=0.0, max=10.0)
+            
+            results[key] = (tf.to(self.dtype), idf.to(self.dtype))
+        
+        return results
+
+
+# ---------- Topic-level TF-IDF stats ----------
+def kmeans_assign(x, k, iters=10):
+    """Simple cosine k-means clustering on device.
+    
+    Args:
+        x: Input tensor [N, D]
+        k: Number of clusters
+        iters: Number of iterations
+    
+    Returns:
+        labels: Cluster assignments [N]
+    """
+    x = torch.nn.functional.normalize(x, dim=1)
+    N, D = x.shape
+    
+    # Initialize centers with random subset
+    idx = torch.randperm(N, device=x.device)[:k]
+    centers = x[idx].clone()
+    
+    for _ in range(iters):
+        # Assign to nearest center
+        sims = x @ centers.T  # [N, k]
+        labels = sims.argmax(dim=1)  # [N]
+        
+        # Update centers
+        for j in range(k):
+            mask = labels == j
+            if mask.any():
+                centers[j] = torch.nn.functional.normalize(x[mask].mean(dim=0), dim=0)
+    
+    return labels
+
+
+class TopicTFIDFStats(DocTFIDFStats):
+    """Topic-level TF-IDF statistics using semantic clustering.
+    
+    Extends DocTFIDFStats by clustering tokens into K topics and computing
+    TF-IDF at the topic level rather than document level.
+    """
+    def __init__(self, device, dtype=torch.float32, k_topics=64, proj_dim=128, **kw):
+        super().__init__(device, dtype, **kw)
+        self.k = k_topics
+        self.proj = None
+        self.proj_dim = proj_dim
+        self.topic_tf_sum = {}   # layer_key -> [C]
+        self.topic_df = {}       # layer_key -> [C]
+        self.topic_count = 0
+
+    @torch.no_grad()
+    def update_doc_with_topics(self, layer_key: str, acts: torch.Tensor):
+        """Update statistics with topic-clustered activations.
+        
+        Args:
+            layer_key: Layer identifier
+            acts: Activation tensor [tokens, channels]
+        """
+        T, C = acts.shape
+        self._ensure(layer_key, C)
+        A = acts.abs().to(device=self.device, dtype=self.dtype)
+
+        # Lazy-init random projection for clustering tokens
+        if self.proj is None:
+            D = A.shape[1]
+            self.proj = torch.randn(D, self.proj_dim, device=A.device, dtype=A.dtype) / (D ** 0.5)
+
+        # Project tokens and cluster
+        Z = A @ self.proj  # [tokens, proj_dim]
+        labels = kmeans_assign(Z, self.k, iters=4)
+        
+        # Initialize accumulators if needed
+        if layer_key not in self.topic_tf_sum:
+            self.topic_tf_sum[layer_key] = torch.zeros(C, device=A.device, dtype=A.dtype)
+            self.topic_df[layer_key] = torch.zeros(C, device=A.device, dtype=torch.int32)
+        
+        # For each topic, compute per-channel mean and active-any
+        for t in range(self.k):
+            mask = labels == t
+            if not mask.any():
+                continue
+            
+            chunk = A[mask]  # [tokens_in_topic, C]
+            tf_t = chunk.mean(dim=0)  # Per-channel mean
+            
+            # Count as "active in topic" if any token crosses within-topic threshold
+            k_val = max(1, int(0.60 * chunk.shape[0]))
+            thr, _ = torch.kthvalue(chunk, k_val, dim=0)
+            active = (chunk >= thr.unsqueeze(0)).any(dim=0)
+
+            self.topic_tf_sum[layer_key] += tf_t
+            self.topic_df[layer_key] += active.to(torch.int32)
+
+        self.topic_count += 1
+
+    @torch.no_grad()
+    def finalize_topics(self):
+        """Compute final topic-level TF and IDF tensors."""
+        results = {}
+        for key in self.topic_tf_sum.keys():
+            # TF: average activation strength across topics
+            tf_topic = self.topic_tf_sum[key] / max(self.topic_count, 1)
+            
+            # IDF: inverse topic frequency
+            df_topic = self.topic_df[key].to(torch.float32)
+            idf_topic = torch.log((self.k + 1.0) / (df_topic + 1.0)) + 1.0
+            
+            # Sanitize
+            tf_topic = torch.nan_to_num(tf_topic, nan=0.0)
+            idf_topic = torch.clamp(torch.nan_to_num(idf_topic, nan=1.0), min=0.0, max=10.0)
+            
+            results[key] = (tf_topic.to(self.dtype), idf_topic.to(self.dtype))
+        
+        return results
+
+
+# ---------- Compute per-weight scores from TF-IDF tensors ----------
+def broadcast_to_weights(weight: torch.Tensor, per_channel_vec: torch.Tensor, name: str):
+    """Broadcast per-channel scores to per-weight scores.
+    
+    Args:
+        weight: Weight tensor [out_features, in_features]
+        per_channel_vec: Per-channel scores [channels]
+        name: Module name (determines broadcast direction)
+    
+    Returns:
+        Broadcasted tensor matching weight shape
+    """
+    if ("gate_proj" in name) or ("up_proj" in name):
+        # Column-wise scores (output channels)
+        return per_channel_vec.view(-1, 1).expand_as(weight)
+    elif "down_proj" in name:
+        # Row-wise scores (input channels)
+        return per_channel_vec.view(1, -1).expand_as(weight)
+    else:
+        # Fallback: column-wise
+        return per_channel_vec.view(-1, 1).expand_as(weight)
+
+
+def compute_tfidf_scores(weight: torch.Tensor,
+                         name: str,
+                         tf: torch.Tensor,
+                         idf: torch.Tensor,
+                         alpha=1.0,
+                         beta=1.0,
+                         gamma=1.0,
+                         add_spikiness: torch.Tensor = None,
+                         rho=0.0):
+    """Compute per-weight importance scores using TF-IDF formula.
+    
+    Score = |W|^α × TF^β × IDF^γ × (spikiness^ρ if provided)
+    
+    Args:
+        weight: Weight tensor
+        name: Module name
+        tf: Per-channel term frequency
+        idf: Per-channel inverse document frequency
+        alpha: Weight magnitude exponent
+        beta: TF exponent
+        gamma: IDF exponent
+        add_spikiness: Optional per-channel spikiness scores
+        rho: Spikiness exponent
+    
+    Returns:
+        Per-weight importance scores
+    """
+    Wmag = weight.abs().to(torch.float32)
+    
+    # Per-channel score: TF^β × IDF^γ
+    s_ch = (tf.clamp_min(0.0) ** beta) * (idf.clamp_min(0.0) ** gamma)
+    
+    # Optional spikiness multiplier
+    if rho > 0.0 and (add_spikiness is not None):
+        s_ch = s_ch * (add_spikiness.clamp_min(1e-6) ** rho)
+    
+    # Broadcast to per-weight and combine with magnitude
+    S = broadcast_to_weights(Wmag, s_ch, name)
+    return (Wmag ** alpha) * S
