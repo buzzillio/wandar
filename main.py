@@ -242,9 +242,9 @@ def main():
 
     # Wanda hyperparameters
     parser.add_argument('--w-alpha', dest='w_alpha', type=float, default=1.0,
-                        help='Exponent α for weight magnitude in Wanda: |W|^α × |X|^β (default: 1.0)')
+                        help='Multiplier α for weight magnitude in Wanda: |W| * α × |X| * β (default: 1.0)')
     parser.add_argument('--w-beta', dest='w_beta', type=float, default=1.0,
-                        help='Exponent β for activation magnitude in Wanda: |W|^α × |X|^β (default: 1.0)')
+                        help='Multiplier β for activation magnitude in Wanda: |W| * α × |X| * β (default: 1.0)')
 
     parser.add_argument("--eval_zero_shot", action="store_true")
     args = parser.parse_args()
