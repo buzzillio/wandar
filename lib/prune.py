@@ -332,31 +332,16 @@ def prune_neuronrank_unstructured(args, model, tokenizer, device=torch.device("c
     if prune_n != 0 or prune_m != 0:
         raise ValueError("NeuronRank unstructured pruning does not support N:M sparsity.")
 
-    # Warn if attention will be skipped due to magnitude_multi=0
-    # But only if pruning_last is NOT set (which forces MLP-only anyway)
-    if args.magnitude_multi == 0.0 and args.nr_include_attention and args.pruning_last is None:
-        print("Note: magnitude_multi=0.0, so attention layers will be skipped (only MLP layers pruned).")
-        print("      To prune attention, set --magnitude-multi to a non-zero value (e.g., 1.0)")
-    
+    # Inform user about pruning scope
     if args.pruning_last is not None:
-        print(f"Note: --pruning_last {args.pruning_last} is set, so only MLP layers in the last {args.pruning_last} transformer blocks will be pruned (attention always skipped).")
-
-    def _apply_unstructured_mask(weight_tensor, metric_tensor, ratio):
-        numel = metric_tensor.numel()
-        num_to_prune = int(numel * ratio)
-        if num_to_prune <= 0:
-            return 0, numel
-
-        flat_metric = metric_tensor.reshape(-1)
-        threshold_idx = min(num_to_prune, flat_metric.numel() - 1)
-        threshold = torch.sort(flat_metric)[0][threshold_idx]
-        mask = metric_tensor <= threshold
-        weight_tensor[mask] = 0
-        return mask.sum().item(), numel
+        print(f"Note: --pruning_last {args.pruning_last} is set. Only MLP layers in the last {args.pruning_last} blocks will be pruned.")
+    elif args.magnitude_multi == 0.0 and args.nr_include_attention:
+        print("Note: magnitude_multi=0.0 and pruning all layers. Attention layers will be skipped as they lack variance stats.")
 
     use_cache = model.config.use_cache
     model.config.use_cache = False
 
+    print("Loading calibration data for NeuronRank...")
     dataloader, _ = get_loaders(
         "c4",
         nsamples=args.nsamples,
@@ -365,15 +350,14 @@ def prune_neuronrank_unstructured(args, model, tokenizer, device=torch.device("c
         tokenizer=tokenizer,
     )
 
+    # --- Step 1: Collect stats and compute scores for all layers ---
+    print("Collecting activation statistics...")
     stats = collect_neuronrank_statistics(
-        model,
-        dataloader,
-        tokenizer,
-        device,
-        max_classes=args.neuronrank_max_classes,
+        model, dataloader, tokenizer, device, max_classes=args.neuronrank_max_classes
     )
-    print(f"Collected statistics for {len(stats)} layers")
+    print(f"Collected statistics for {len(stats)} layers.")
     
+    print("Computing scores...")
     scores = compute_neuronrank_scores(
         model,
         stats,
@@ -382,111 +366,138 @@ def prune_neuronrank_unstructured(args, model, tokenizer, device=torch.device("c
         variance_multi=args.variance_multi,
         magnitude_multi=args.magnitude_multi,
     )
-    print(f"Computed scores for {len(scores)} layers")
-    print(f"Scoring parameters: variance_exp={args.variance_exp}, variance_multi={args.variance_multi}, magnitude_multi={args.magnitude_multi}")
+    print(f"Computed scores for {len(scores)} layers using params: var_exp={args.variance_exp}, var_multi={args.variance_multi}, mag_multi={args.magnitude_multi}")
 
-    total_pruned = 0
-    total_weights = 0
-
-    magnitude_scale = float(args.magnitude_multi)
-
+    # --- Step 2: Separate layers into MLP and Attention groups for consistent pruning ---
     layers = model.model.layers
     total_layers = len(layers)
     
+    mlp_weights = []
+    mlp_metrics = []
+    attn_weights = []
+    attn_metrics = []
+
     for i, layer in enumerate(layers):
         subset = find_layers(layer)
         layer_entry = scores.get(i)
-        layer_variance = None
-        if isinstance(layer_entry, dict):
-            layer_variance = layer_entry.get("variance")
+        layer_variance = layer_entry.get("variance") if isinstance(layer_entry, dict) else None
 
         for name, module in subset.items():
-            # Check pruning_last flag first
             if not should_prune_module(args, i, total_layers, name):
-                if args.pruning_last is not None:
-                    print(f"[NeuronRank] Skipping layer {i} module {name} (not in last {args.pruning_last} MLP layers)")
-                continue
-                
-            if not args.nr_include_attention and "mlp" not in name:
-                print(f"[NeuronRank] Skipping layer {i} module {name} (nr_include_attention=False)")
                 continue
 
-            print(f"[NeuronRank] Processing layer {i} module {name}")
+            is_mlp = "mlp" in name
+            is_attn = not is_mlp and args.nr_include_attention
+
+            if not is_mlp and not is_attn:
+                continue
+
             weight = module.weight.data
-            if args.sparsity_ratio <= 0:
-                continue
-
             metric = None
-            if magnitude_scale != 0.0:
-                metric = torch.abs(weight).to(torch.float32) * magnitude_scale
 
-            if (
-                layer_variance is not None
-                and "mlp" in name
-            ):
+            # Base magnitude component (if used)
+            if args.magnitude_multi != 0.0:
+                metric = torch.abs(weight).to(torch.float32) * args.magnitude_multi
+
+            # Add variance component for MLP layers
+            if is_mlp and layer_variance is not None and args.variance_multi != 0.0:
                 variance_vec = layer_variance.to(weight.device, dtype=torch.float32)
-                if args.variance_exp == 0.0:
-                    variance_term = torch.ones_like(variance_vec)
-                elif args.variance_exp == 1.0:
+                
+                if args.variance_exp == 1.0:
                     variance_term = variance_vec
                 else:
                     variance_term = torch.pow(variance_vec.clamp(min=1e-12), args.variance_exp)
 
                 variance_component = variance_term * args.variance_multi
+                
                 if "gate_proj" in name or "up_proj" in name:
                     addition = variance_component.view(-1, 1)
                 elif "down_proj" in name:
                     addition = variance_component.view(1, -1)
                 else:
-                    addition = None
+                    addition = None # Should not happen for MLP
+
                 if addition is not None:
-                    addition = addition.to(weight.device, dtype=torch.float32)
                     if metric is None:
                         metric = torch.zeros_like(weight, dtype=torch.float32)
-                    metric = metric + addition
+                    metric += addition.to(weight.device)
 
             if metric is None:
-                # No metric available (e.g., attention layers without variance stats or magnitude_multi=0)
-                if "mlp" not in name:
-                    # Attention layers: if magnitude_multi=0, we should skip them 
-                    # because mixing magnitude and variance scores causes inconsistent pruning
-                    if magnitude_scale == 0.0:
-                        # Skip attention when only using variance (variance stats only available for MLP)
-                        continue
-                    else:
-                        # Use magnitude for attention
-                        metric = torch.abs(weight).to(torch.float32)
-                else:
-                    # MLP layers without variance stats should be skipped
-                    print(f"Warning: Layer {i} {name} (MLP) has no variance stats, skipping")
-                    continue
-
+                print(f"Warning: No metric could be computed for layer {i} {name}. Skipping.")
+                continue
+            
             if not torch.isfinite(metric).all():
                 metric = torch.nan_to_num(metric, nan=0.0, posinf=0.0, neginf=0.0)
 
             if torch.count_nonzero(metric).item() == 0:
                 continue
 
-            pruned, numel = _apply_unstructured_mask(weight, metric, args.sparsity_ratio)
-            total_pruned += pruned
-            total_weights += numel
+            # Add to appropriate group
+            if is_mlp:
+                mlp_weights.append(weight)
+                mlp_metrics.append(metric)
+            elif is_attn:
+                attn_weights.append(weight)
+                attn_metrics.append(metric)
 
-            print(f"[NeuronRank-Unstructured] layer {i} name {name} pruned {pruned} / {numel}")
+    # --- Step 3: Apply pruning masks independently to each group ---
+    def _apply_global_mask(weights, metrics, ratio):
+        if not metrics:
+            return 0, 0
+            
+        # Flatten all metrics into a single tensor to find the global threshold
+        global_metric = torch.cat([m.reshape(-1) for m in metrics])
+        num_to_prune = int(global_metric.numel() * ratio)
+        
+        if num_to_prune <= 0:
+            return 0, global_metric.numel()
 
+        threshold = torch.kthvalue(global_metric, num_to_prune).values
+        
+        total_pruned = 0
+        total_params = 0
+        for w, m in zip(weights, metrics):
+            mask = m <= threshold
+            w[mask] = 0
+            total_pruned += mask.sum().item()
+            total_params += w.numel()
+            
+        return total_pruned, total_params
+
+    total_pruned = 0
+    total_weights = 0
+
+    # Prune MLP layers
+    pruned, params = _apply_global_mask(mlp_weights, mlp_metrics, args.sparsity_ratio)
+    total_pruned += pruned
+    total_weights += params
+    if params > 0:
+        print(f"[NeuronRank] Pruned MLP layers: {pruned}/{params} ({100.*pruned/params:.2f}%)")
+
+    # Prune Attention layers (if they were collected)
+    # This is done separately to avoid scale mismatch with MLP metrics
+    pruned, params = _apply_global_mask(attn_weights, attn_metrics, args.sparsity_ratio)
+    total_pruned += pruned
+    total_weights += params
+    if params > 0:
+        print(f"[NeuronRank] Pruned Attention layers: {pruned}/{params} ({100.*pruned/params:.2f}%)")
+
+    # Prune LM Head if requested
     if args.nr_prune_lm_head and hasattr(model, "lm_head") and isinstance(model.lm_head, nn.Linear):
         weight = model.lm_head.weight.data
+        # LM head is always pruned by magnitude
         metric = torch.abs(weight)
-        pruned, numel = _apply_unstructured_mask(weight, metric, args.sparsity_ratio)
+        pruned, numel = _apply_global_mask([weight], [metric], args.sparsity_ratio)
         total_pruned += pruned
         total_weights += numel
-        print(f"[NeuronRank-Unstructured] lm_head pruned {pruned} / {numel}")
+        print(f"[NeuronRank] Pruned lm_head: {pruned}/{numel}")
 
     model.config.use_cache = use_cache
     torch.cuda.empty_cache()
 
-    if total_weights:
+    if total_weights > 0:
         pct = 100.0 * total_pruned / total_weights
-        print(f"[NeuronRank-Unstructured] global pruning ratio {pct:.2f}% ({total_pruned}/{total_weights})")
+        print(f"[NeuronRank] Global pruning ratio: {pct:.2f}% ({total_pruned}/{total_weights})")
 
 
 def prune_neuronrank_old(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0, prune_m=0):
