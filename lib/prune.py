@@ -177,9 +177,10 @@ def prune_magnitude(args, model, tokenizer, device=torch.device("cuda:0"), prune
             # Check if we should prune this module based on pruning_last flag
             if not should_prune_module(args, i, total_layers, name):
                 if args.pruning_last is not None:
-                    print(f"Skipping layer {i} module {name} (not in last {args.pruning_last} MLP layers)")
+                    print(f"[Magnitude] Skipping layer {i} module {name} (not in last {args.pruning_last} MLP layers)")
                 continue
             
+            print(f"[Magnitude] Pruning layer {i} module {name}")
             W = subset[name].weight.data
             
             # Handle meta tensors by getting the actual device from device_map
@@ -218,6 +219,7 @@ def prune_magnitude(args, model, tokenizer, device=torch.device("cuda:0"), prune
                     W_mask = (W_metric <= thresh)
 
             W[W_mask] = 0
+            print(f"[Magnitude] Pruned layer {i} module {name}: {W_mask.sum().item()}/{W.numel()} weights")
     
     # Clean up memory after pruning
     torch.cuda.empty_cache()
@@ -394,12 +396,14 @@ def prune_neuronrank_unstructured(args, model, tokenizer, device=torch.device("c
             # Check pruning_last flag first
             if not should_prune_module(args, i, total_layers, name):
                 if args.pruning_last is not None:
-                    print(f"Skipping layer {i} module {name} (not in last {args.pruning_last} MLP layers)")
+                    print(f"[NeuronRank] Skipping layer {i} module {name} (not in last {args.pruning_last} MLP layers)")
                 continue
                 
             if not args.nr_include_attention and "mlp" not in name:
+                print(f"[NeuronRank] Skipping layer {i} module {name} (nr_include_attention=False)")
                 continue
 
+            print(f"[NeuronRank] Processing layer {i} module {name}")
             weight = module.weight.data
             if args.sparsity_ratio <= 0:
                 continue
