@@ -165,6 +165,26 @@ def return_given_alpha(alpha, sort_res, W_metric, tmp_metric, sum_before):
     cur_sparsity = (W_mask==True).sum() / W_mask.numel()
     return W_mask, cur_sparsity
 
+
+def _apply_unstructured_mask(weight_tensor: torch.Tensor, metric_tensor: torch.Tensor, ratio: float):
+    """Zero-out the lowest-scoring weights according to the metric."""
+    numel = weight_tensor.numel()
+    if numel == 0:
+        return 0, 0
+
+    num_to_prune = int(ratio * numel)
+    if num_to_prune <= 0:
+        return 0, numel
+
+    flat_metric = metric_tensor.reshape(-1)
+    k = min(max(num_to_prune, 1), flat_metric.numel())
+    threshold = torch.kthvalue(flat_metric, k).values
+
+    mask = metric_tensor <= threshold
+    pruned = mask.sum().item()
+    weight_tensor[mask] = 0
+    return pruned, numel
+
 def prune_magnitude(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0, prune_m=0):
     layers = model.model.layers 
     total_layers = len(layers)
@@ -198,28 +218,19 @@ def prune_magnitude(args, model, tokenizer, device=torch.device("cuda:0"), prune
                     print(f"ERROR: Layer {i} {name} is on meta device - model not fully loaded!")
                 continue
             
-            W_metric = torch.abs(W)
+            W_metric = torch.abs(W).to(torch.float32)
             if prune_n != 0:
                 W_mask = (torch.zeros_like(W)==1)
                 for ii in range(W_metric.shape[1]):
                     if ii % prune_m == 0:
                         tmp = W_metric[:,ii:(ii+prune_m)].float()
                         W_mask.scatter_(1,ii+torch.topk(tmp, prune_n,dim=1, largest=False)[1], True)
+                W[W_mask] = 0
+                pruned = W_mask.sum().item()
+                print(f"[Magnitude] Pruned layer {i} module {name}: {pruned}/{W.numel()} weights")
             else:
-                # Memory-efficient thresholding using kthvalue instead of sorting
-                with torch.no_grad():
-                    flat = W_metric.detach().reshape(-1)  # stays on GPU
-                    k = int(flat.numel() * args.sparsity_ratio)
-                    if k > 0 and k < flat.numel():
-                        thresh = flat.kthvalue(k).values  # GPU scalar
-                    elif k == 0:
-                        thresh = flat.min() - 1  # prune nothing
-                    else:
-                        thresh = flat.max() + 1  # prune everything
-                    W_mask = (W_metric <= thresh)
-
-            W[W_mask] = 0
-            print(f"[Magnitude] Pruned layer {i} module {name}: {W_mask.sum().item()}/{W.numel()} weights")
+                pruned, numel = _apply_unstructured_mask(W, W_metric, args.sparsity_ratio)
+                print(f"[Magnitude] Pruned layer {i} module {name}: {pruned}/{numel} weights")
     
     # Clean up memory after pruning
     torch.cuda.empty_cache()
@@ -281,27 +292,28 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
 
         for name in subset:
             print(f"pruning layer {i} name {name}")
-            W_metric = torch.abs(subset[name].weight.data) * torch.sqrt(wrapped_layers[name].scaler_row.reshape((1,-1)))
+            weight = subset[name].weight.data
+            scaler = torch.sqrt(wrapped_layers[name].scaler_row.reshape((1, -1))).to(weight.device, dtype=torch.float32)
+            W_metric = torch.abs(weight).to(torch.float32) * scaler
 
-            W_mask = (torch.zeros_like(W_metric) == 1)  ## initialize a mask to be all False
+            W_mask = None
             if prune_n != 0:
                 # structured n:m sparsity
+                W_mask = (torch.zeros_like(weight, dtype=torch.bool))
                 for ii in range(W_metric.shape[1]):
                     if ii % prune_m == 0:
                         tmp = W_metric[:,ii:(ii+prune_m)].float()
-                        W_mask.scatter_(1,ii+torch.topk(tmp, prune_n,dim=1, largest=False)[1], True)
+                        W_mask.scatter_(1, ii + torch.topk(tmp, prune_n, dim=1, largest=False)[1], True)
             else:
-                sort_res = torch.sort(W_metric, dim=-1, stable=True)
-
                 if args.use_variant:
-                    # wanda variant 
+                    sort_res = torch.sort(W_metric, dim=-1, stable=True)
                     tmp_metric = torch.cumsum(sort_res[0], dim=1)
                     sum_before = W_metric.sum(dim=1)
 
                     alpha = 0.4
                     alpha_hist = [0., 0.8]
                     W_mask, cur_sparsity = return_given_alpha(alpha, sort_res, W_metric, tmp_metric, sum_before)
-                    while (torch.abs(cur_sparsity - args.sparsity_ratio)>0.001) and (alpha_hist[1]-alpha_hist[0]>=0.001):
+                    while (torch.abs(cur_sparsity - args.sparsity_ratio) > 0.001) and (alpha_hist[1] - alpha_hist[0] >= 0.001):
                         if cur_sparsity > args.sparsity_ratio:
                             alpha_new = (alpha + alpha_hist[0]) / 2.0
                             alpha_hist[1] = alpha
@@ -309,15 +321,16 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
                             alpha_new = (alpha + alpha_hist[1]) / 2.0
                             alpha_hist[0] = alpha
 
-                        alpha = alpha_new 
+                        alpha = alpha_new
                         W_mask, cur_sparsity = return_given_alpha(alpha, sort_res, W_metric, tmp_metric, sum_before)
                     print(f"alpha found {alpha} sparsity {cur_sparsity:.6f}")
                 else:
-                    # unstructured pruning
-                    indices = sort_res[1][:,:int(W_metric.shape[1]*args.sparsity_ratio)]
-                    W_mask.scatter_(1, indices, True)
+                    pruned, numel = _apply_unstructured_mask(weight, W_metric, args.sparsity_ratio)
+                    print(f"[Wanda] layer {i} name {name} pruned {pruned}/{numel}")
+                    continue
 
-            subset[name].weight.data[W_mask] = 0  ## set weights to zero 
+            if W_mask is not None:
+                weight[W_mask] = 0
 
         for j in range(args.nsamples):
             with torch.no_grad():
@@ -332,11 +345,10 @@ def prune_neuronrank_unstructured(args, model, tokenizer, device=torch.device("c
     if prune_n != 0 or prune_m != 0:
         raise ValueError("NeuronRank unstructured pruning does not support N:M sparsity.")
 
-    # Inform user about pruning scope
     if args.pruning_last is not None:
-        print(f"Note: --pruning_last {args.pruning_last} is set. Only MLP layers in the last {args.pruning_last} blocks will be pruned.")
+        print(f"Note: --pruning_last {args.pruning_last} is set. Only MLP modules in the last {args.pruning_last} transformer blocks will be pruned.")
     elif args.magnitude_multi == 0.0 and args.nr_include_attention:
-        print("Note: magnitude_multi=0.0 and pruning all layers. Attention layers will be skipped as they lack variance stats.")
+        print("Note: magnitude_multi=0.0. Attention modules will be skipped because they lack variance statistics.")
 
     use_cache = model.config.use_cache
     model.config.use_cache = False
@@ -350,14 +362,16 @@ def prune_neuronrank_unstructured(args, model, tokenizer, device=torch.device("c
         tokenizer=tokenizer,
     )
 
-    # --- Step 1: Collect stats and compute scores for all layers ---
     print("Collecting activation statistics...")
     stats = collect_neuronrank_statistics(
-        model, dataloader, tokenizer, device, max_classes=args.neuronrank_max_classes
+        model,
+        dataloader,
+        tokenizer,
+        device,
+        max_classes=args.neuronrank_max_classes,
     )
-    print(f"Collected statistics for {len(stats)} layers.")
-    
-    print("Computing scores...")
+    print(f"Collected statistics for {len(stats)} layers")
+
     scores = compute_neuronrank_scores(
         model,
         stats,
@@ -366,16 +380,16 @@ def prune_neuronrank_unstructured(args, model, tokenizer, device=torch.device("c
         variance_multi=args.variance_multi,
         magnitude_multi=args.magnitude_multi,
     )
-    print(f"Computed scores for {len(scores)} layers using params: var_exp={args.variance_exp}, var_multi={args.variance_multi}, mag_multi={args.magnitude_multi}")
+    print(
+        f"Computed scores for {len(scores)} layers (variance_exp={args.variance_exp}, "
+        f"variance_multi={args.variance_multi}, magnitude_multi={args.magnitude_multi})"
+    )
 
-    # --- Step 2: Separate layers into MLP and Attention groups for consistent pruning ---
+    total_pruned = 0
+    total_weights = 0
+
     layers = model.model.layers
     total_layers = len(layers)
-    
-    mlp_weights = []
-    mlp_metrics = []
-    attn_weights = []
-    attn_metrics = []
 
     for i, layer in enumerate(layers):
         subset = find_layers(layer)
@@ -384,120 +398,81 @@ def prune_neuronrank_unstructured(args, model, tokenizer, device=torch.device("c
 
         for name, module in subset.items():
             if not should_prune_module(args, i, total_layers, name):
+                if args.pruning_last is not None:
+                    print(f"[NeuronRank] Skipping layer {i} module {name} (not in last {args.pruning_last} MLP layers)")
                 continue
 
-            is_mlp = "mlp" in name
-            is_attn = not is_mlp and args.nr_include_attention
-
-            if not is_mlp and not is_attn:
+            if not args.nr_include_attention and "mlp" not in name:
+                print(f"[NeuronRank] Skipping layer {i} module {name} (nr_include_attention=False)")
                 continue
 
             weight = module.weight.data
+            if args.sparsity_ratio <= 0:
+                continue
+
             metric = None
-
-            # Base magnitude component (if used)
             if args.magnitude_multi != 0.0:
-                metric = torch.abs(weight).to(torch.float32) * args.magnitude_multi
+                metric = torch.abs(weight).to(torch.float32) * float(args.magnitude_multi)
 
-            # Add variance component for MLP layers
-            if is_mlp and layer_variance is not None and args.variance_multi != 0.0:
+            if layer_variance is not None and "mlp" in name and args.variance_multi != 0.0:
                 variance_vec = layer_variance.to(weight.device, dtype=torch.float32)
-                
-                if args.variance_exp == 1.0:
+                if args.variance_exp == 0.0:
+                    variance_term = torch.ones_like(variance_vec)
+                elif args.variance_exp == 1.0:
                     variance_term = variance_vec
                 else:
                     variance_term = torch.pow(variance_vec.clamp(min=1e-12), args.variance_exp)
 
-                variance_component = variance_term * args.variance_multi
-                
+                variance_component = variance_term * float(args.variance_multi)
                 if "gate_proj" in name or "up_proj" in name:
                     addition = variance_component.view(-1, 1)
                 elif "down_proj" in name:
                     addition = variance_component.view(1, -1)
                 else:
-                    addition = None # Should not happen for MLP
+                    addition = None
 
                 if addition is not None:
+                    addition = addition.to(weight.device, dtype=torch.float32)
                     if metric is None:
                         metric = torch.zeros_like(weight, dtype=torch.float32)
-                    metric += addition.to(weight.device)
+                    metric = metric + addition
 
             if metric is None:
-                print(f"Warning: No metric could be computed for layer {i} {name}. Skipping.")
-                continue
-            
+                if "mlp" not in name:
+                    if args.magnitude_multi == 0.0:
+                        print(f"[NeuronRank] Skipping layer {i} module {name} (no metric available)")
+                        continue
+                    metric = torch.abs(weight).to(torch.float32)
+                else:
+                    print(f"[NeuronRank] Warning: layer {i} module {name} has no variance stats; using magnitude only")
+                    metric = torch.abs(weight).to(torch.float32)
+
             if not torch.isfinite(metric).all():
                 metric = torch.nan_to_num(metric, nan=0.0, posinf=0.0, neginf=0.0)
 
             if torch.count_nonzero(metric).item() == 0:
                 continue
 
-            # Add to appropriate group
-            if is_mlp:
-                mlp_weights.append(weight)
-                mlp_metrics.append(metric)
-            elif is_attn:
-                attn_weights.append(weight)
-                attn_metrics.append(metric)
+            pruned, numel = _apply_unstructured_mask(weight, metric, args.sparsity_ratio)
+            total_pruned += pruned
+            total_weights += numel
 
-    # --- Step 3: Apply pruning masks independently to each group ---
-    def _apply_global_mask(weights, metrics, ratio):
-        if not metrics:
-            return 0, 0
-            
-        # Flatten all metrics into a single tensor to find the global threshold
-        global_metric = torch.cat([m.reshape(-1) for m in metrics])
-        num_to_prune = int(global_metric.numel() * ratio)
-        
-        if num_to_prune <= 0:
-            return 0, global_metric.numel()
+            print(f"[NeuronRank-Unstructured] layer {i} module {name} pruned {pruned}/{numel}")
 
-        threshold = torch.kthvalue(global_metric, num_to_prune).values
-        
-        total_pruned = 0
-        total_params = 0
-        for w, m in zip(weights, metrics):
-            mask = m <= threshold
-            w[mask] = 0
-            total_pruned += mask.sum().item()
-            total_params += w.numel()
-            
-        return total_pruned, total_params
-
-    total_pruned = 0
-    total_weights = 0
-
-    # Prune MLP layers
-    pruned, params = _apply_global_mask(mlp_weights, mlp_metrics, args.sparsity_ratio)
-    total_pruned += pruned
-    total_weights += params
-    if params > 0:
-        print(f"[NeuronRank] Pruned MLP layers: {pruned}/{params} ({100.*pruned/params:.2f}%)")
-
-    # Prune Attention layers (if they were collected)
-    # This is done separately to avoid scale mismatch with MLP metrics
-    pruned, params = _apply_global_mask(attn_weights, attn_metrics, args.sparsity_ratio)
-    total_pruned += pruned
-    total_weights += params
-    if params > 0:
-        print(f"[NeuronRank] Pruned Attention layers: {pruned}/{params} ({100.*pruned/params:.2f}%)")
-
-    # Prune LM Head if requested
     if args.nr_prune_lm_head and hasattr(model, "lm_head") and isinstance(model.lm_head, nn.Linear):
         weight = model.lm_head.weight.data
-        # LM head is always pruned by magnitude
-        metric = torch.abs(weight)
-        pruned, numel = _apply_global_mask([weight], [metric], args.sparsity_ratio)
+        metric = torch.abs(weight).to(torch.float32)
+        pruned, numel = _apply_unstructured_mask(weight, metric, args.sparsity_ratio)
         total_pruned += pruned
         total_weights += numel
-        print(f"[NeuronRank] Pruned lm_head: {pruned}/{numel}")
+        print(f"[NeuronRank-Unstructured] lm_head pruned {pruned}/{numel}")
 
     model.config.use_cache = use_cache
     torch.cuda.empty_cache()
 
-    if total_weights > 0:
+    if total_weights:
         pct = 100.0 * total_pruned / total_weights
-        print(f"[NeuronRank] Global pruning ratio: {pct:.2f}% ({total_pruned}/{total_weights})")
+        print(f"[NeuronRank-Unstructured] global pruning ratio {pct:.2f}% ({total_pruned}/{total_weights})")
 
 
 def prune_neuronrank_old(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0, prune_m=0):
@@ -543,19 +518,6 @@ def prune_neuronrank_old(args, model, tokenizer, device=torch.device("cuda:0"), 
 
     if args.sparsity_type == "unstructured":
         # Unstructured pruning: prune individual weights
-        def _apply_unstructured_mask(weight_tensor, metric_tensor, ratio):
-            numel = metric_tensor.numel()
-            num_to_prune = int(numel * ratio)
-            if num_to_prune <= 0:
-                return 0, numel
-
-            flat_metric = metric_tensor.reshape(-1)
-            threshold_idx = min(num_to_prune, flat_metric.numel() - 1)
-            threshold = torch.sort(flat_metric)[0][threshold_idx]
-            mask = metric_tensor <= threshold
-            weight_tensor[mask] = 0
-            return mask.sum().item(), numel
-
         for i, layer in enumerate(layers):
             subset = find_layers(layer)
             layer_scores = scores.get(i)
@@ -574,19 +536,20 @@ def prune_neuronrank_old(args, model, tokenizer, device=torch.device("cuda:0"), 
                 if args.sparsity_ratio <= 0:
                     continue
 
+                abs_weight = torch.abs(weight).to(torch.float32)
+
                 # Build metric from neuron scores
                 if layer_scores is None:
-                    metric = torch.abs(weight).to(torch.float32)
+                    metric = abs_weight
                 else:
                     neuron_scores = layer_scores.to(weight.device, dtype=torch.float32)
-                    
-                    # Broadcast neuron scores to weight dimensions
+
                     if "gate_proj" in name or "up_proj" in name:
-                        metric = neuron_scores.view(-1, 1).expand_as(weight)
+                        metric = abs_weight * neuron_scores.view(-1, 1)
                     elif "down_proj" in name:
-                        metric = neuron_scores.view(1, -1).expand_as(weight)
+                        metric = abs_weight * neuron_scores.view(1, -1)
                     else:
-                        metric = torch.abs(weight).to(torch.float32)
+                        metric = abs_weight
 
                 if not torch.isfinite(metric).all():
                     metric = torch.nan_to_num(metric, nan=0.0, posinf=0.0, neginf=0.0)
