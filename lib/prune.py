@@ -123,9 +123,9 @@ def prepare_calibration_input(model, dataloader, device):
     model.config.use_cache = False
     layers = model.model.layers
 
-    # dev = model.hf_device_map["model.embed_tokens"]
-    if "model.embed_tokens" in model.hf_device_map:
-        device = model.hf_device_map["model.embed_tokens"]
+    device_map = getattr(model, "hf_device_map", None)
+    if device_map and "model.embed_tokens" in device_map:
+        device = device_map["model.embed_tokens"]
 
     dtype = next(iter(model.parameters())).dtype
     inps = torch.zeros((128, model.seqlen, model.config.hidden_size), dtype=dtype, device=device)
@@ -249,6 +249,7 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
 
     layers = model.model.layers
     total_layers = len(layers)
+    device_map = getattr(model, "hf_device_map", None)
     
     for i in range(len(layers)):
         layer = layers[i]
@@ -268,8 +269,8 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
             
         subset = filtered_subset
 
-        if f"model.layers.{i}" in model.hf_device_map:   ## handle the case for llama-30B and llama-65B, when the device map has multiple GPUs;
-            dev = model.hf_device_map[f"model.layers.{i}"]
+        if device_map and f"model.layers.{i}" in device_map:   ## handle the case for llama-30B and llama-65B, when the device map has multiple GPUs;
+            dev = device_map[f"model.layers.{i}"]
             inps, outs, attention_mask, position_ids = inps.to(dev), outs.to(dev), attention_mask.to(dev), position_ids.to(dev)
 
         wrapped_layers = {}
@@ -797,8 +798,9 @@ def prune_sparsegpt(args, model, tokenizer, dev, prune_n=0, prune_m=0):
     model.config.use_cache = False
     layers = model.model.layers
 
-    if "model.embed_tokens" in model.hf_device_map:
-        dev = model.hf_device_map["model.embed_tokens"]
+    device_map = getattr(model, "hf_device_map", None)
+    if device_map and "model.embed_tokens" in device_map:
+        dev = device_map["model.embed_tokens"]
 
     dtype = next(iter(model.parameters())).dtype
     inps = torch.zeros(
@@ -835,8 +837,8 @@ def prune_sparsegpt(args, model, tokenizer, dev, prune_n=0, prune_m=0):
     
     for i in range(len(layers)):
         layer = layers[i]
-        if f"model.layers.{i}" in model.hf_device_map:
-            dev = model.hf_device_map[f"model.layers.{i}"]
+        if device_map and f"model.layers.{i}" in device_map:
+            dev = device_map[f"model.layers.{i}"]
             print(f"layer {i} device {dev}")
             inps, outs, attention_mask, position_ids = inps.to(dev), outs.to(dev), attention_mask.to(dev), position_ids.to(dev)
 
@@ -904,8 +906,9 @@ def prune_ablate(args, model, tokenizer, dev, prune_n=0, prune_m=0):
     model.config.use_cache = False
     layers = model.model.layers
 
-    if "model.embed_tokens" in model.hf_device_map:
-        dev = model.hf_device_map["model.embed_tokens"]
+    device_map = getattr(model, "hf_device_map", None)
+    if device_map and "model.embed_tokens" in device_map:
+        dev = device_map["model.embed_tokens"]
 
     dtype = next(iter(model.parameters())).dtype
     inps = torch.zeros(
@@ -942,8 +945,8 @@ def prune_ablate(args, model, tokenizer, dev, prune_n=0, prune_m=0):
     
     for i in range(len(layers)):
         layer = layers[i]
-        if f"model.layers.{i}" in model.hf_device_map:
-            dev = model.hf_device_map[f"model.layers.{i}"]
+        if device_map and f"model.layers.{i}" in device_map:
+            dev = device_map[f"model.layers.{i}"]
             print(f"layer {i} device {dev}")
             inps, outs, attention_mask, position_ids = inps.to(dev), outs.to(dev), attention_mask.to(dev), position_ids.to(dev)
 
