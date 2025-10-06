@@ -685,11 +685,32 @@ def prune_neuronrank_tfidf(args, model, tokenizer, device, prune_n=0, prune_m=0)
         
         return hook
     
-    # Register hooks on MLP gate_proj modules
+    # Register hooks on MLP modules (always)
     for i, layer in enumerate(layers):
         if hasattr(layer, 'mlp') and hasattr(layer.mlp, 'gate_proj'):
             h = layer.mlp.gate_proj.register_forward_hook(make_hook(i, 'mlp.gate_proj'))
             handles.append(h)
+    
+    # Register hooks on attention modules (if enabled)
+    if args.nr_include_attention:
+        print("📊 Including attention layers (collecting q_proj, k_proj, v_proj, o_proj statistics)")
+        for i, layer in enumerate(layers):
+            if hasattr(layer, 'self_attn'):
+                attn = layer.self_attn
+                if hasattr(attn, 'q_proj'):
+                    h = attn.q_proj.register_forward_hook(make_hook(i, 'self_attn.q_proj'))
+                    handles.append(h)
+                if hasattr(attn, 'k_proj'):
+                    h = attn.k_proj.register_forward_hook(make_hook(i, 'self_attn.k_proj'))
+                    handles.append(h)
+                if hasattr(attn, 'v_proj'):
+                    h = attn.v_proj.register_forward_hook(make_hook(i, 'self_attn.v_proj'))
+                    handles.append(h)
+                if hasattr(attn, 'o_proj'):
+                    h = attn.o_proj.register_forward_hook(make_hook(i, 'self_attn.o_proj'))
+                    handles.append(h)
+    else:
+        print("⏭️  Skipping attention layers (--nr-skip-attention)")
     
     print(f"✅ Registered {len(handles)} forward hooks")
     
@@ -743,19 +764,33 @@ def prune_neuronrank_tfidf(args, model, tokenizer, device, prune_n=0, prune_m=0)
                 skipped_should_not_prune += 1
                 continue
             
-            # Only prune MLP modules (we only collected stats for gate_proj)
-            if 'mlp' not in name:
+            # Check if we should skip attention modules
+            is_attention = 'self_attn' in name
+            is_mlp = 'mlp' in name
+            
+            if not is_mlp and not is_attention:
+                skipped_not_mlp += 1
+                continue
+            
+            if is_attention and not args.nr_include_attention:
                 skipped_not_mlp += 1
                 continue
             
             # Get weight tensor
             W = subset[name].weight.data
-            layer_key = f"layer_{i}.mlp.gate_proj"
+            
+            # Determine which statistics to use
+            if is_mlp:
+                # For MLP modules, use gate_proj statistics
+                layer_key = f"layer_{i}.mlp.gate_proj"
+            else:
+                # For attention modules, use the specific projection's statistics
+                layer_key = f"layer_{i}.{name}"
             
             # Check if we have TF-IDF stats for this layer
             if layer_key not in tfidf_stats:
                 if i < 3:  # Only print for first few layers to avoid spam
-                    print(f"  Warning: No TF-IDF statistics for {layer_key}, skipping layer {i}")
+                    print(f"  Warning: No TF-IDF statistics for {layer_key}, skipping layer {i} {name}")
                 skipped_no_stats += 1
                 continue
             
@@ -792,6 +827,23 @@ def prune_neuronrank_tfidf(args, model, tokenizer, device, prune_n=0, prune_m=0)
             
             if i < 2 or i >= total_layers - 2:  # Print first 2 and last 2 layers
                 print(f"  [NeuronRank-TFIDF] layer {i:2d} {name:20s}: pruned {pruned:7d}/{numel:7d} weights")
+    
+    # Optional: Prune LM head using magnitude
+    if args.nr_prune_lm_head and hasattr(model, 'lm_head'):
+        print("📝 Pruning LM head using magnitude...")
+        lm_head_weight = model.lm_head.weight.data
+        lm_head_metric = lm_head_weight.abs().to(torch.float32)
+        
+        # Sanitize
+        lm_head_metric = torch.nan_to_num(lm_head_metric, nan=0.0, posinf=0.0, neginf=0.0)
+        
+        if torch.count_nonzero(lm_head_metric).item() > 0:
+            pruned, numel = _apply_unstructured_mask(lm_head_weight, lm_head_metric, args.sparsity_ratio)
+            total_pruned += pruned
+            total_weights += numel
+            print(f"  [NeuronRank-TFIDF] lm_head: pruned {pruned:7d}/{numel:7d} weights")
+        else:
+            print(f"  Warning: LM head has all-zero metric, skipping")
     
     model.config.use_cache = use_cache
     

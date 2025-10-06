@@ -11,6 +11,17 @@
 ✅ **Better at 50% sparsity**: The doc/topic-level context prevents over-pruning useful neurons  
 ✅ **Consistent pipeline**: Uses same per-module masking as other methods (magnitude, wanda)  
 ✅ **Single-pass collection**: No gradients required, efficient statistics gathering  
+✅ **Full model support**: Can prune MLPs, attention layers, and LM head  
+
+## 🆕 Full Model Pruning
+
+TF-IDF++ now supports pruning the **entire model**, not just MLPs:
+
+- **MLP layers**: gate_proj, up_proj, down_proj
+- **Attention layers**: q_proj, k_proj, v_proj, o_proj
+- **LM head**: output projection
+
+See **[FULL_MODEL_PRUNING.md](FULL_MODEL_PRUNING.md)** for detailed usage and configurations.  
 
 ## Two Modes
 
@@ -85,6 +96,22 @@ Where:
 
 --nr-spikiness-exp 0.0             # ρ: Optional spikiness multiplier
                                    # Try: 0.0 (off), 0.3, 0.5, 1.0
+```
+
+### 🆕 Full Model Control Flags
+
+```bash
+--nr-include-attention             # Prune attention layers (DEFAULT)
+                                   # Collects stats for q/k/v/o_proj
+
+--nr-skip-attention                # Skip attention layers
+                                   # Only prune MLP modules
+
+--nr-prune-lm-head                 # Also prune LM head using magnitude
+                                   # Independent of attention flag
+
+--pruning_last 30                  # Only prune last N layers (MLP only)
+                                   # Overrides attention flag
 ```
 
 ### Shared Arguments

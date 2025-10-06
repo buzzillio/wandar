@@ -718,12 +718,22 @@ def broadcast_to_weights(weight: torch.Tensor, per_channel_vec: torch.Tensor, na
     Returns:
         Broadcasted tensor matching weight shape
     """
+    # MLP projections
     if ("gate_proj" in name) or ("up_proj" in name):
         # Column-wise scores (output channels)
         return per_channel_vec.view(-1, 1).expand_as(weight)
     elif "down_proj" in name:
         # Row-wise scores (input channels)
         return per_channel_vec.view(1, -1).expand_as(weight)
+    
+    # Attention projections
+    elif ("q_proj" in name) or ("k_proj" in name) or ("v_proj" in name):
+        # Column-wise scores (output channels)
+        return per_channel_vec.view(-1, 1).expand_as(weight)
+    elif "o_proj" in name:
+        # Row-wise scores (input channels from concat heads)
+        return per_channel_vec.view(1, -1).expand_as(weight)
+    
     else:
         # Fallback: column-wise
         return per_channel_vec.view(-1, 1).expand_as(weight)
