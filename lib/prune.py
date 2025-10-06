@@ -333,9 +333,13 @@ def prune_neuronrank_unstructured(args, model, tokenizer, device=torch.device("c
         raise ValueError("NeuronRank unstructured pruning does not support N:M sparsity.")
 
     # Warn if attention will be skipped due to magnitude_multi=0
-    if args.magnitude_multi == 0.0 and args.nr_include_attention:
+    # But only if pruning_last is NOT set (which forces MLP-only anyway)
+    if args.magnitude_multi == 0.0 and args.nr_include_attention and args.pruning_last is None:
         print("Note: magnitude_multi=0.0, so attention layers will be skipped (only MLP layers pruned).")
         print("      To prune attention, set --magnitude-multi to a non-zero value (e.g., 1.0)")
+    
+    if args.pruning_last is not None:
+        print(f"Note: --pruning_last {args.pruning_last} is set, so only MLP layers in the last {args.pruning_last} transformer blocks will be pruned (attention always skipped).")
 
     def _apply_unstructured_mask(weight_tensor, metric_tensor, ratio):
         numel = metric_tensor.numel()
@@ -368,6 +372,8 @@ def prune_neuronrank_unstructured(args, model, tokenizer, device=torch.device("c
         device,
         max_classes=args.neuronrank_max_classes,
     )
+    print(f"Collected statistics for {len(stats)} layers")
+    
     scores = compute_neuronrank_scores(
         model,
         stats,
@@ -376,6 +382,8 @@ def prune_neuronrank_unstructured(args, model, tokenizer, device=torch.device("c
         variance_multi=args.variance_multi,
         magnitude_multi=args.magnitude_multi,
     )
+    print(f"Computed scores for {len(scores)} layers")
+    print(f"Scoring parameters: variance_exp={args.variance_exp}, variance_multi={args.variance_multi}, magnitude_multi={args.magnitude_multi}")
 
     total_pruned = 0
     total_weights = 0
