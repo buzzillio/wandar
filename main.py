@@ -71,13 +71,26 @@ print('accelerate', version('accelerate'))
 print('# of gpus: ', torch.cuda.device_count())
 
 def get_llm(model_name, cache_dir="llm_weights"):
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name, 
-        torch_dtype=torch.float16, 
-        cache_dir=cache_dir, 
-        low_cpu_mem_usage=True, 
-        device_map="auto"
-    )
+    # For smaller models (7B, 13B), load directly to GPU without device_map
+    # device_map="auto" can cause meta tensor issues with pruning
+    if "30b" in model_name.lower() or "65b" in model_name.lower() or "70b" in model_name.lower():
+        # Large models need device_map for multi-GPU
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name, 
+            torch_dtype=torch.float16, 
+            cache_dir=cache_dir, 
+            low_cpu_mem_usage=True, 
+            device_map="auto"
+        )
+    else:
+        # Smaller models: load directly to GPU 0
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name, 
+            torch_dtype=torch.float16, 
+            cache_dir=cache_dir, 
+            low_cpu_mem_usage=True, 
+            device_map=None
+        ).cuda()
 
     model.seqlen = model.config.max_position_embeddings 
     return model

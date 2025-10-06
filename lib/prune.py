@@ -179,7 +179,24 @@ def prune_magnitude(args, model, tokenizer, device=torch.device("cuda:0"), prune
                 if args.pruning_last is not None:
                     print(f"Skipping layer {i} module {name} (not in last {args.pruning_last} MLP layers)")
                 continue
-            W = subset[name].weight.data 
+            
+            W = subset[name].weight.data
+            
+            # Handle meta tensors by getting the actual device from device_map
+            if W.device.type == 'meta':
+                if hasattr(model, 'hf_device_map'):
+                    # Find the actual device for this layer
+                    layer_key = f"model.layers.{i}"
+                    if layer_key in model.hf_device_map:
+                        actual_device = model.hf_device_map[layer_key]
+                        print(f"Warning: Layer {i} {name} on meta device, expected device: {actual_device}")
+                        print(f"Skipping - model may not be fully loaded. Try running without device_map='auto'")
+                    else:
+                        print(f"ERROR: Layer {i} {name} is on meta device and no device mapping found!")
+                else:
+                    print(f"ERROR: Layer {i} {name} is on meta device - model not fully loaded!")
+                continue
+            
             W_metric = torch.abs(W)
             if prune_n != 0:
                 W_mask = (torch.zeros_like(W)==1)
@@ -313,6 +330,11 @@ def prune_neuronrank_unstructured(args, model, tokenizer, device=torch.device("c
     if prune_n != 0 or prune_m != 0:
         raise ValueError("NeuronRank unstructured pruning does not support N:M sparsity.")
 
+    # Warn if attention will be skipped due to magnitude_multi=0
+    if args.magnitude_multi == 0.0 and args.nr_include_attention:
+        print("Note: magnitude_multi=0.0, so attention layers will be skipped (only MLP layers pruned).")
+        print("      To prune attention, set --magnitude-multi to a non-zero value (e.g., 1.0)")
+
     def _apply_unstructured_mask(weight_tensor, metric_tensor, ratio):
         numel = metric_tensor.numel()
         num_to_prune = int(numel * ratio)
@@ -412,7 +434,20 @@ def prune_neuronrank_unstructured(args, model, tokenizer, device=torch.device("c
                     metric = metric + addition
 
             if metric is None:
-                continue
+                # No metric available (e.g., attention layers without variance stats or magnitude_multi=0)
+                if "mlp" not in name:
+                    # Attention layers: if magnitude_multi=0, we should skip them 
+                    # because mixing magnitude and variance scores causes inconsistent pruning
+                    if magnitude_scale == 0.0:
+                        # Skip attention when only using variance (variance stats only available for MLP)
+                        continue
+                    else:
+                        # Use magnitude for attention
+                        metric = torch.abs(weight).to(torch.float32)
+                else:
+                    # MLP layers without variance stats should be skipped
+                    print(f"Warning: Layer {i} {name} (MLP) has no variance stats, skipping")
+                    continue
 
             if not torch.isfinite(metric).all():
                 metric = torch.nan_to_num(metric, nan=0.0, posinf=0.0, neginf=0.0)
