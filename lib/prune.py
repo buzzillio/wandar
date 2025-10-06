@@ -946,6 +946,16 @@ def prune_hybrid(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=
     print(f"🧠 PART 2: {args.hybrid_mlp_method.upper()} Statistics for MLP Layers")
     print("=" * 60)
     
+    # IMPORTANT: Reload calibration data (dataloader is exhausted after first pass)
+    print("📂 Reloading calibration data for MLP statistics...")
+    dataloader, _ = get_loaders(
+        "c4",
+        nsamples=args.nsamples,
+        seed=args.seed,
+        seqlen=model.seqlen,
+        tokenizer=tokenizer,
+    )
+    
     mlp_stats = {}
     
     if args.hybrid_mlp_method == 'neuronrank_tfidf':
@@ -1075,6 +1085,11 @@ def prune_hybrid(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=
     mlp_pruned = 0
     mlp_weights = 0
     
+    # Debug counters
+    mlp_skipped_no_stats = 0
+    mlp_skipped_zero_metric = 0
+    mlp_attempted = 0
+    
     for i in range(total_layers):
         layer = layers[i]
         subset = find_layers(layer)
@@ -1089,6 +1104,12 @@ def prune_hybrid(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=
             
             if not is_attention and not is_mlp:
                 continue
+            
+            # Debug: Track MLP attempts
+            if is_mlp:
+                mlp_attempted += 1
+                if i == 0:  # Debug first layer
+                    print(f"  [DEBUG] Attempting MLP layer {i} {name}")
             
             # ===== ATTENTION: Use Wanda =====
             if is_attention:
@@ -1120,6 +1141,9 @@ def prune_hybrid(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=
                     layer_key = f"layer_{i}.mlp.gate_proj"
                     
                     if layer_key not in mlp_stats:
+                        if i == 0:  # Debug
+                            print(f"  [DEBUG] No stats for {layer_key}, available: {list(mlp_stats.keys())[:3]}")
+                        mlp_skipped_no_stats += 1
                         continue
                     
                     tf, idf = mlp_stats[layer_key]
@@ -1166,6 +1190,9 @@ def prune_hybrid(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=
                 metric = torch.nan_to_num(metric, nan=0.0, posinf=0.0, neginf=0.0)
                 
                 if torch.count_nonzero(metric).item() == 0:
+                    if i == 0:  # Debug
+                        print(f"  [DEBUG] Zero metric for {name}")
+                    mlp_skipped_zero_metric += 1
                     continue
                 
                 pruned, numel = _apply_unstructured_mask(W, metric, args.sparsity_ratio)
@@ -1193,6 +1220,9 @@ def prune_hybrid(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=
     if mlp_weights > 0:
         mlp_sparsity = mlp_pruned / mlp_weights
         print(f"  MLP ({args.hybrid_mlp_method}): {mlp_pruned:,}/{mlp_weights:,} weights ({mlp_sparsity:.2%} sparsity)")
+    else:
+        print(f"  ⚠️  MLP: NO WEIGHTS PRUNED!")
+        print(f"     Debug: mlp_attempted={mlp_attempted}, skipped_no_stats={mlp_skipped_no_stats}, skipped_zero_metric={mlp_skipped_zero_metric}")
     
     if total_weights > 0:
         total_sparsity = total_pruned / total_weights
