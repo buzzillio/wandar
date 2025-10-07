@@ -628,6 +628,131 @@ def prune_neuronrank_old(args, model, tokenizer, device=torch.device("cuda:0"), 
         print(f"[NeuronRank-OLD] global pruning ratio {pct:.2f}% ({total_pruned}/{total_weights})")
 
 
+def prune_neuronrank_last(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0, prune_m=0):
+    """NeuronRank-LAST: Exact implementation of the NeuronRank formula
+    
+    Score = |W|^α × TF^β × IDF^γ
+    
+    Where:
+    - |W|^α: Weight magnitude (absolute value)
+    - TF^β: Term Frequency (average activation strength)
+    - IDF^γ: Inverse Document Frequency (activation selectivity/sparsity)
+    
+    TF = (1/T) × Σ|activation_t| where T = total tokens
+    IDF = log((T+1)/(n_active+1)) + 1 where n_active = tokens where activation > 0
+    
+    Only supports unstructured pruning of MLP layers.
+    """
+    use_cache = model.config.use_cache
+    model.config.use_cache = False
+
+    print("=" * 60)
+    print("🎯 NeuronRank-LAST: |W|^α × TF^β × IDF^γ")
+    print("=" * 60)
+    
+    # Get exponents from args (default to 1.0)
+    weight_exp = getattr(args, 'weight_exp', 1.0)
+    tf_exp = getattr(args, 'tf_exp', 1.0)
+    idf_exp = getattr(args, 'idf_exp', 1.0)
+    
+    print(f"Exponents: α={weight_exp} (weight), β={tf_exp} (TF), γ={idf_exp} (IDF)")
+    print(f"Sparsity target: {args.sparsity_ratio:.1%}")
+    
+    if args.sparsity_type != "unstructured":
+        raise ValueError("neuronrank_last only supports unstructured pruning")
+
+    print("\nLoading calibration data...")
+    dataloader, _ = get_loaders(
+        "c4",
+        nsamples=args.nsamples,
+        seed=args.seed,
+        seqlen=model.seqlen,
+        tokenizer=tokenizer,
+    )
+
+    print("Collecting TF-IDF statistics...")
+    from lib.neuronrank import collect_neuronrank_old_statistics, compute_neuronrank_old_scores
+    
+    stats = collect_neuronrank_old_statistics(model, dataloader, device)
+    
+    print("\nComputing neuron importance scores...")
+    scores = compute_neuronrank_old_scores(
+        model,
+        stats,
+        weight_exp=weight_exp,
+        tf_exp=tf_exp,
+        idf_exp=idf_exp,
+    )
+
+    layers = model.model.layers
+    total_layers = len(layers)
+    total_pruned = 0
+    total_weights = 0
+
+    print("\nApplying unstructured pruning to MLP layers...")
+    
+    for i, layer in enumerate(layers):
+        subset = find_layers(layer)
+        layer_scores = scores.get(i)
+        
+        for name, module in subset.items():
+            # Check pruning_last flag
+            if not should_prune_module(args, i, total_layers, name):
+                if args.pruning_last is not None and i == total_layers - args.pruning_last - 1:
+                    print(f"Skipping layer {i} module {name} (not in last {args.pruning_last} MLP layers)")
+                continue
+            
+            # Only prune MLP modules
+            if "mlp" not in name:
+                continue
+
+            weight = module.weight.data
+            if args.sparsity_ratio <= 0:
+                continue
+
+            abs_weight = torch.abs(weight).to(torch.float32)
+
+            # Build metric from neuron scores
+            if layer_scores is None:
+                metric = abs_weight
+            else:
+                neuron_scores = layer_scores.to(weight.device, dtype=torch.float32)
+
+                if "gate_proj" in name or "up_proj" in name:
+                    # Column projection: broadcast neuron scores across rows
+                    metric = abs_weight * neuron_scores.view(-1, 1)
+                elif "down_proj" in name:
+                    # Row projection: broadcast neuron scores across columns
+                    metric = abs_weight * neuron_scores.view(1, -1)
+                else:
+                    metric = abs_weight
+
+            # Sanitize metric
+            if not torch.isfinite(metric).all():
+                metric = torch.nan_to_num(metric, nan=0.0, posinf=0.0, neginf=0.0)
+
+            if torch.count_nonzero(metric).item() == 0:
+                continue
+
+            pruned, numel = _apply_unstructured_mask(weight, metric, args.sparsity_ratio)
+            total_pruned += pruned
+            total_weights += numel
+
+            if i < 3 or i >= total_layers - 3:
+                print(f"  Layer {i:2d} {name:20s}: pruned {pruned:7d}/{numel:7d} weights")
+
+    model.config.use_cache = use_cache
+    torch.cuda.empty_cache()
+
+    print("\n" + "=" * 60)
+    if total_weights:
+        pct = 100.0 * total_pruned / total_weights
+        print(f"✅ NeuronRank-LAST: Pruned {total_pruned:,}/{total_weights:,} weights ({pct:.2f}%)")
+    else:
+        print("⚠️  No weights were pruned!")
+    print("=" * 60)
+
+
 def prune_neuronrank_tfidf(args, model, tokenizer, device, prune_n=0, prune_m=0):
     """
     NeuronRank TF-IDF++ pruning with doc-level or topic-level IDF.
@@ -1193,6 +1318,10 @@ def prune_hybrid(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=
                         print(f"  [DEBUG] Layer {i} {name}: tf shape={tf.shape}, range=[{tf.min():.6f}, {tf.max():.6f}]")
                         print(f"  [DEBUG] Layer {i} {name}: idf shape={idf.shape}, range=[{idf.min():.6f}, {idf.max():.6f}]")
                         print(f"  [DEBUG] Layer {i} {name}: W shape={W.shape}")
+                    
+                    # Debug exponents
+                    if i == 0:
+                        print(f"  [DEBUG] Exponents: α={args.weight_exp}, β={args.tf_exp}, γ={args.idf_exp}, ρ={args.nr_spikiness_exp}")
                     
                     # Compute TF-IDF metric
                     metric = compute_tfidf_scores(
