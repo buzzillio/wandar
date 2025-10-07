@@ -507,7 +507,10 @@ def prune_neuronrank_old(args, model, tokenizer, device=torch.device("cuda:0"), 
     print("Collecting TF-IDF statistics")
     from lib.neuronrank import collect_neuronrank_old_statistics, compute_neuronrank_old_scores
     
-    stats = collect_neuronrank_old_statistics(model, dataloader, device)
+    # Get activation threshold from args (default to 1e-6)
+    activation_threshold = getattr(args, 'activation_threshold', 1e-6)
+    
+    stats = collect_neuronrank_old_statistics(model, dataloader, device, activation_threshold=activation_threshold)
     
     # Get exponents from args (default to 1.0 if not specified)
     weight_exp = getattr(args, 'weight_exp', 1.0)
@@ -673,7 +676,10 @@ def prune_neuronrank_last(args, model, tokenizer, device=torch.device("cuda:0"),
     print("Collecting TF-IDF statistics...")
     from lib.neuronrank import collect_neuronrank_old_statistics, compute_neuronrank_old_scores
     
-    stats = collect_neuronrank_old_statistics(model, dataloader, device)
+    # Get activation threshold from args (default to 1e-6)
+    activation_threshold = getattr(args, 'activation_threshold', 1e-6)
+    
+    stats = collect_neuronrank_old_statistics(model, dataloader, device, activation_threshold=activation_threshold)
     
     print("\nComputing neuron importance scores...")
     scores = compute_neuronrank_old_scores(
@@ -1168,6 +1174,9 @@ def prune_hybrid(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=
         from lib.neuronrank import TFIDFStats, compute_neuronrank_old_scores
         import torch.nn.functional as F
         
+        # Get activation threshold from args
+        activation_threshold = getattr(args, 'activation_threshold', 1e-6)
+        
         # Create per-layer statistics collectors
         layer_stats = {}
         mlp_handles = []
@@ -1184,7 +1193,8 @@ def prune_hybrid(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=
             layer_stats[layer_idx] = TFIDFStats(
                 size=gate_proj.out_features,
                 dtype=layer_dtype,
-                device=layer_device
+                device=layer_device,
+                activation_threshold=activation_threshold
             )
 
             def make_hook(idx):

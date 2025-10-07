@@ -11,14 +11,15 @@ class TFIDFStats:
     IDF (Inverse Document Frequency): Selectivity based on how rarely neuron fires
     """
 
-    def __init__(self, size: int, dtype: torch.dtype = torch.float32, device: Union[torch.device, str] = "cpu"):
+    def __init__(self, size: int, dtype: torch.dtype = torch.float32, device: Union[torch.device, str] = "cpu", activation_threshold: float = 1e-6):
         self.size = size
         self.dtype = dtype
         self.device = device
+        self.activation_threshold = activation_threshold
         self.total_tokens = 0
         # Sum of absolute activations for TF
         self.activation_sum = torch.zeros(size, dtype=dtype, device=device)
-        # Count of tokens where neuron fired (activation > 0)
+        # Count of tokens where neuron fired (activation > threshold)
         self.active_count = torch.zeros(size, dtype=torch.long, device=device)
 
     def update(self, activations: torch.Tensor):
@@ -37,8 +38,10 @@ class TFIDFStats:
         abs_act = torch.abs(activations)
         self.activation_sum += abs_act.sum(dim=0)
         
-        # IDF: count where neuron is active (activation > 0)
-        active_mask = abs_act > 0
+        # IDF: count where neuron is active (activation > threshold)
+        # Threshold avoids counting near-zero floating point values
+        # This gives better selectivity signal than activation > 0
+        active_mask = abs_act > self.activation_threshold
         self.active_count += active_mask.sum(dim=0).to(torch.long)
         
         self.total_tokens += num_tokens
@@ -363,12 +366,18 @@ def apply_neuronrank_pruning(model, scores, sparsity_ratio):
     return total_pruned, total_channels
 
 
-def collect_neuronrank_old_statistics(model, dataloader, device):
+def collect_neuronrank_old_statistics(model, dataloader, device, activation_threshold=1e-6):
     """Collect TF-IDF statistics for old NeuronRank formula.
     
     For each MLP gate projection, tracks:
     - TF: Average absolute activation strength across all tokens
     - IDF: Selectivity measure based on how often neuron fires
+    
+    Args:
+        model: The model to collect statistics from
+        dataloader: Calibration data
+        device: Device to run on
+        activation_threshold: Threshold for considering neuron "active" (default: 1e-6)
     """
     
     if not hasattr(model, "model") or not hasattr(model.model, "layers"):
@@ -378,7 +387,7 @@ def collect_neuronrank_old_statistics(model, dataloader, device):
     if not batches:
         raise ValueError("Calibration dataloader for NeuronRank produced no batches.")
 
-    print(f"Collecting TF-IDF statistics ({len(batches)} batches)")
+    print(f"Collecting TF-IDF statistics ({len(batches)} batches, threshold={activation_threshold})")
 
     layer_stats = {}
     hooks = []
@@ -394,7 +403,8 @@ def collect_neuronrank_old_statistics(model, dataloader, device):
         layer_stats[layer_idx] = TFIDFStats(
             size=gate_proj.out_features,
             dtype=layer_dtype,
-            device=layer_device
+            device=layer_device,
+            activation_threshold=activation_threshold
         )
 
         def make_hook(idx):

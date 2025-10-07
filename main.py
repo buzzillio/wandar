@@ -247,6 +247,10 @@ def main():
     parser.add_argument('--w-beta', dest='w_beta', type=float, default=1.0,
                         help='Multiplier β for activation magnitude in Wanda: |W| * α × |X| * β (default: 1.0)')
 
+    # NeuronRank activation threshold
+    parser.add_argument('--threshold', dest='activation_threshold', type=float, default=1e-6,
+                        help='Activation threshold for IDF calculation (default: 1e-6). Neurons with activation > threshold are considered "active".')
+
     parser.add_argument("--eval_zero_shot", action="store_true")
     args = parser.parse_args()
 
