@@ -302,11 +302,15 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
             weight = subset[name].weight.data
             scaler = torch.sqrt(wrapped_layers[name].scaler_row.reshape((1, -1))).to(weight.device, dtype=torch.float32)
             
-            # Apply Wanda hyperparameters: |W| * α × |X| * β
-            w_alpha = getattr(args, 'w_alpha', 1.0)
-            w_beta = getattr(args, 'w_beta', 1.0)
-            
-            W_metric = (torch.abs(weight).to(torch.float32) * w_alpha) * (scaler * w_beta)
+            # Apply Wanda hyperparameters and normalize to avoid numerical instability
+            weight_component = torch.abs(weight).to(torch.float32) * w_alpha
+            activation_component = scaler * w_beta
+            W_metric = weight_component * activation_component
+
+            # Normalize to prevent small values from causing precision issues
+            # This makes the ranking robust to the scale of alpha and beta
+            if W_metric.max() > 0:
+                W_metric = W_metric / W_metric.max()
 
             W_mask = None
             if prune_n != 0:
