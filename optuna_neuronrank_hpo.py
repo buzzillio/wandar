@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-"""Hyperparameter optimization runner for NeuronRank unstructured pruning.
+"""Hyperparameter optimization runner for Wanda pruning.
 
-This script wraps ``main.py`` with an Optuna study to tune the NeuronRank
-scoring multipliers. It keeps the base command fixed and searches over the
-user-requested ranges for ``--discrimination-multi``, ``--discrimination-exp``,
-and ``--magnitude-multi`` using discrete steps of 0.5. Lower perplexity is
-better, so the Optuna objective minimizes the Wikitext perplexity reported by
-``main.py``.
+This script wraps ``main.py`` with an Optuna study to tune the Wanda
+scoring multipliers (--w-alpha and --w-beta). It keeps the base command 
+fixed and searches over the specified ranges using discrete steps of 0.2. 
+Lower perplexity is better, so the Optuna objective minimizes the Wikitext 
+perplexity reported by ``main.py``.
 """
 
 from __future__ import annotations
@@ -28,12 +27,11 @@ BASE_COMMAND = [
     "--model",
     "baffo32/decapoda-research-llama-7B-hf",
     "--prune_method",
-    "neuronrank_unstructured",
+    "wanda",
     "--sparsity_ratio",
     "0.5",
     "--sparsity_type",
     "unstructured",
-    "--nr-prune-lm-head",
     "--nsamples",
     "128",
 ]
@@ -42,29 +40,29 @@ PPL_REGEX = re.compile(r"wikitext perplexity\s+([0-9]+\.?[0-9]*)", re.IGNORECASE
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Optuna HPO for NeuronRank")
+    parser = argparse.ArgumentParser(description="Optuna HPO for Wanda")
     parser.add_argument(
         "--n-trials",
         type=int,
-        default=20,
+        default=25,
         help="Number of Optuna trials to run.",
     )
     parser.add_argument(
         "--study-name",
         type=str,
-        default="neuronrank_hpo",
+        default="wanda_hpo",
         help="Name of the Optuna study.",
     )
     parser.add_argument(
         "--storage",
         type=str,
         default=None,
-        help="Optuna storage URL (e.g., sqlite:///neuronrank.db). If omitted, an in-memory study is used.",
+        help="Optuna storage URL (e.g., sqlite:///wanda.db). If omitted, an in-memory study is used.",
     )
     parser.add_argument(
         "--save-dir",
         type=str,
-        default="out/nr_unstructured_hpo",
+        default="out/wanda_hpo",
         help="Base directory where trial outputs will be written.",
     )
     parser.add_argument(
@@ -87,16 +85,14 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def build_command(save_path: Path, variance_exp: float, variance_multi: float, magnitude_multi: float) -> list[str]:
+def build_command(save_path: Path, w_alpha: float, w_beta: float) -> list[str]:
     command = list(BASE_COMMAND)
     command.extend(
         [
-            "--variance-exp",
-            f"{variance_exp}",
-            "--variance-multi",
-            f"{variance_multi}",
-            "--magnitude-multi",
-            f"{magnitude_multi}",
+            "--w-alpha",
+            f"{w_alpha}",
+            "--w-beta",
+            f"{w_beta}",
             "--save",
             str(save_path),
         ]
@@ -154,23 +150,21 @@ def main() -> None:
     env.setdefault("PYTHONUNBUFFERED", "1")
 
     def objective(trial: optuna.trial.Trial) -> float:
-        variance_exp = trial.suggest_float("variance_exp", 0.5, 3.0, step=0.5)
-        variance_multi = trial.suggest_float("variance_multi", 0.0, 3.0, step=0.5)
-        magnitude_multi = trial.suggest_float("magnitude_multi", 0.0, 3.0, step=0.5)
+        # Search ranges: 0.2 to 1.0 with step 0.2
+        w_alpha = trial.suggest_float("w_alpha", 0.2, 1.0, step=0.2)
+        w_beta = trial.suggest_float("w_beta", 0.2, 1.0, step=0.2)
 
         trial_save_dir = save_dir / f"trial_{trial.number:04d}"
         trial_save_dir.mkdir(parents=True, exist_ok=True)
 
         command = build_command(
             trial_save_dir,
-            variance_exp=variance_exp,
-            variance_multi=variance_multi,
-            magnitude_multi=magnitude_multi,
+            w_alpha=w_alpha,
+            w_beta=w_beta,
         )
 
         print(
-            f"[Trial {trial.number}] Running: variance_exp={variance_exp}, "
-            f"variance_multi={variance_multi}, magnitude_multi={magnitude_multi}"
+            f"[Trial {trial.number}] Running: w_alpha={w_alpha}, w_beta={w_beta}"
         )
         ppl = run_trial(command, env=env)
         print(f"[Trial {trial.number}] Wikitext perplexity: {ppl:.4f}")
