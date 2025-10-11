@@ -9,6 +9,7 @@ from .neuronrank import (
     collect_neuronrank_statistics,
     compute_neuronrank_scores,
     compute_neuronrank_qda_scores,
+    compute_neuronrank_pca_qda_scores,
     compute_neuronrank_between_scores,
     apply_neuronrank_pruning,
 )
@@ -576,6 +577,91 @@ def prune_neuronrank_qda(args, model, tokenizer, device=torch.device("cuda:0"), 
         print(f"[NeuronRank-QDA] global pruning ratio {pct:.2f}% ({total_pruned}/{total_weights})")
     else:
         print("[NeuronRank-QDA] No weights were pruned.")
+
+
+def prune_neuronrank_pca_qda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0, prune_m=0):
+    if prune_n != 0 or prune_m != 0:
+        raise ValueError("NeuronRank PCA+QDA pruning does not support N:M sparsity.")
+
+    if args.sparsity_type != "unstructured":
+        raise ValueError("NeuronRank PCA+QDA pruning currently supports only unstructured sparsity type.")
+
+    if args.neuronrank_max_classes <= 0:
+        raise ValueError("NeuronRank PCA+QDA pruning requires --neuronrank-max-classes > 0 to collect class statistics.")
+
+    use_cache = model.config.use_cache
+    model.config.use_cache = False
+
+    print("Loading calibration data for NeuronRank-PCA+QDA...")
+    dataloader, _ = get_loaders(
+        "c4",
+        nsamples=args.nsamples,
+        seed=args.seed,
+        seqlen=model.seqlen,
+        tokenizer=tokenizer,
+    )
+
+    print("Collecting activation statistics for PCA+QDA scoring...")
+    stats = collect_neuronrank_statistics(
+        model,
+        dataloader,
+        tokenizer,
+        device,
+        max_classes=args.neuronrank_max_classes,
+    )
+
+    # Get PCA components from args, default to 128
+    pca_components = getattr(args, 'nr_pca_components', 128)
+    print(f"Computing PCA+QDA scores with {pca_components} components...")
+    
+    pca_qda_scores = compute_neuronrank_pca_qda_scores(stats, pca_components=pca_components)
+    if not pca_qda_scores:
+        raise RuntimeError("NeuronRank PCA+QDA pruning could not compute any scores; ensure calibration data and class tracking are available.")
+
+    # Unstructured per-weight masking: |W| * pca_qda_factor
+    total_pruned = 0
+    total_weights = 0
+    layers = model.model.layers
+    total_layers = len(layers)
+    for i, layer in enumerate(layers):
+        subset = find_layers(layer)
+        for name, module in subset.items():
+            if not should_prune_module(args, i, total_layers, name):
+                if args.pruning_last is not None:
+                    print(f"[NeuronRank-PCA+QDA] Skipping layer {i} module {name} (not in last {args.pruning_last} MLP layers)")
+                continue
+            if "mlp" not in name:
+                continue
+            weight = module.weight.data
+            if args.sparsity_ratio <= 0:
+                continue
+            neuron_scores = pca_qda_scores.get(i, {}).get("channel")
+            if neuron_scores is None:
+                continue
+            factor = neuron_scores.to(weight.device, dtype=torch.float32)
+            mean_val = factor.mean().clamp_min(1e-12)
+            factor = (factor / mean_val).clamp_min(1e-6)
+            if "gate_proj" in name or "up_proj" in name:
+                metric = factor.view(-1, 1).expand_as(weight)
+            elif "down_proj" in name:
+                metric = factor.view(1, -1).expand_as(weight)
+            else:
+                metric = factor.view(-1, 1).expand_as(weight)
+            metric = torch.abs(weight).to(torch.float32) * metric
+            metric = torch.nan_to_num(metric, nan=0.0, posinf=0.0, neginf=0.0)
+            if torch.count_nonzero(metric).item() == 0:
+                continue
+            pruned, numel = _apply_unstructured_mask(weight, metric, args.sparsity_ratio)
+            total_pruned += pruned
+            total_weights += numel
+            print(f"[NeuronRank-PCA+QDA] layer {i} module {name} pruned {pruned}/{numel}")
+    model.config.use_cache = use_cache
+    torch.cuda.empty_cache()
+    if total_weights:
+        pct = 100.0 * total_pruned / total_weights
+        print(f"[NeuronRank-PCA+QDA] global pruning ratio {pct:.2f}% ({total_pruned}/{total_weights})")
+    else:
+        print("[NeuronRank-PCA+QDA] No weights were pruned.")
 
 
 def prune_neuronrank_between(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0, prune_m=0):

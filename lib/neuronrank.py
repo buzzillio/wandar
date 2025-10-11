@@ -453,6 +453,127 @@ def compute_neuronrank_qda_scores(stats, eps: float = 1e-12):
     return qda_scores
 
 
+def compute_neuronrank_pca_qda_scores(stats, pca_components: int = 128, eps: float = 1e-12):
+    """Compute PCA+QDA scores: project to PCA space, then apply QDA discriminant analysis.
+    
+    Steps:
+    1. Compute PCA on class means (capturing main directions of class separation)
+    2. Project class means and overall mean to PCA space
+    3. Compute QDA discriminant score in PCA space
+    4. Back-project scores to original neuron space as importance weights
+    
+    Args:
+        stats: NeuronRank statistics with class means, vars, counts
+        pca_components: Number of PCA components to retain (default 128)
+        eps: Numerical stability constant
+    
+    Returns:
+        Dictionary mapping layer_idx to {"channel": score_tensor}
+    """
+    pca_qda_scores: Dict[int, Dict[str, torch.Tensor]] = {}
+
+    for layer_idx, layer_stats in stats.items():
+        token_mean = layer_stats.get("token_mean")
+        class_means = layer_stats.get("class_means")
+        class_vars = layer_stats.get("class_vars")
+        class_counts = layer_stats.get("class_count")
+
+        if token_mean is None or class_means is None or class_vars is None or class_counts is None:
+            continue
+
+        counts = class_counts
+        means = class_means
+        vars_ = class_vars
+        if not (torch.is_tensor(counts) and torch.is_tensor(means) and torch.is_tensor(vars_)):
+            continue
+
+        valid = counts > 1
+        if not valid.any():
+            continue
+
+        counts_valid = counts[valid]
+        means_valid = means[valid]
+        vars_valid = vars_[valid]
+        total = counts_valid.sum()
+        if total <= 0:
+            continue
+
+        D = means_valid.shape[1]
+        K = means_valid.shape[0]
+        
+        # Step 1: PCA on class means (centered by overall mean)
+        centered_means = means_valid - token_mean.unsqueeze(0)  # [K, D]
+        
+        # Handle case where we have fewer classes than requested components
+        n_components = min(pca_components, K, D)
+        
+        if K < 2 or D < 2:
+            # Fallback to simple between-class variance
+            priors = (counts_valid / total).unsqueeze(1)
+            diff = means_valid - token_mean.unsqueeze(0)
+            score = (priors * (diff * diff)).sum(dim=0)
+            score = torch.nan_to_num(score, nan=0.0, posinf=torch.finfo(score.dtype).max, neginf=0.0)
+            pca_qda_scores[layer_idx] = {"channel": score.clamp_min(0.0)}
+            continue
+        
+        # Compute covariance matrix of centered class means
+        # cov = (1/K) * X^T X where X is [K, D]
+        cov_matrix = torch.mm(centered_means.t(), centered_means) / K  # [D, D]
+        
+        # Eigendecomposition
+        try:
+            eigenvalues, eigenvectors = torch.linalg.eigh(cov_matrix)
+            # Sort by descending eigenvalue
+            idx = torch.argsort(eigenvalues, descending=True)
+            eigenvalues = eigenvalues[idx]
+            eigenvectors = eigenvectors[:, idx]
+            
+            # Take top n_components
+            principal_components = eigenvectors[:, :n_components]  # [D, n_components]
+            
+        except RuntimeError:
+            # If eigendecomposition fails, fall back to simple approach
+            priors = (counts_valid / total).unsqueeze(1)
+            diff = means_valid - token_mean.unsqueeze(0)
+            score = (priors * (diff * diff)).sum(dim=0)
+            score = torch.nan_to_num(score, nan=0.0, posinf=torch.finfo(score.dtype).max, neginf=0.0)
+            pca_qda_scores[layer_idx] = {"channel": score.clamp_min(0.0)}
+            continue
+        
+        # Step 2: Project class means and variances to PCA space
+        means_pca = torch.mm(means_valid, principal_components)  # [K, n_components]
+        token_mean_pca = torch.mm(token_mean.unsqueeze(0), principal_components).squeeze(0)  # [n_components]
+        
+        # Project variances (diagonal approximation)
+        # var_pca ≈ PC^T * diag(var) * PC, but we use squared projection as approximation
+        vars_pca = torch.mm(vars_valid, principal_components ** 2)  # [K, n_components]
+        
+        # Step 3: QDA in PCA space
+        priors = (counts_valid / total).unsqueeze(1)  # [K, 1]
+        diff_pca = means_pca - token_mean_pca.unsqueeze(0)  # [K, n_components]
+        denom_pca = vars_pca + eps  # [K, n_components]
+        contrib_pca = priors * (diff_pca * diff_pca) / denom_pca  # [K, n_components]
+        score_pca = contrib_pca.sum(dim=0)  # [n_components]
+        
+        # Step 4: Back-project to original space
+        # Use principal component loadings weighted by PCA-QDA scores
+        score = torch.mm(score_pca.unsqueeze(0), principal_components.t()).squeeze(0)  # [D]
+        
+        # Alternative: Use squared loadings weighted by importance
+        # This emphasizes neurons that contribute most to discriminative PCA directions
+        pc_squared = principal_components ** 2  # [D, n_components]
+        neuron_importance = torch.mm(pc_squared, score_pca.unsqueeze(1)).squeeze(1)  # [D]
+        
+        # Combine both signals
+        score = score * 0.5 + neuron_importance * 0.5
+        
+        # Sanitize
+        score = torch.nan_to_num(score, nan=0.0, posinf=torch.finfo(score.dtype).max, neginf=0.0)
+        pca_qda_scores[layer_idx] = {"channel": score.clamp_min(0.0)}
+
+    return pca_qda_scores
+
+
 def apply_neuronrank_pruning(model, scores, sparsity_ratio):
     total_channels = 0
     total_pruned = 0

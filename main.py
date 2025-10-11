@@ -54,6 +54,7 @@ from lib.prune import (
     prune_neuronrank_tfidf,
     prune_neuronrank_last,
     prune_neuronrank_qda,
+    prune_neuronrank_pca_qda,
     prune_neuronrank_between,
     prune_hybrid,
     prune_wanda_idf,
@@ -183,7 +184,7 @@ def main():
     parser.add_argument("--prune_method", type=str, choices=["magnitude", "wanda", "sparsegpt", 
                         "ablate_mag_seq", "ablate_wanda_seq", "ablate_mag_iter", "ablate_wanda_iter", "search", 
                         "neuronrank", "neuronrank_unstructured", "neuronrank_variance", "neuronrank_old",
-                        "neuronrank_tfidf", "neuronrank_last", "neuronrank_qda", "neuronrank_between", "hybrid",
+                        "neuronrank_tfidf", "neuronrank_last", "neuronrank_qda", "neuronrank_pca_qda", "neuronrank_between", "hybrid",
                         "wanda_idf", "wanda_spiky", "wanda_selective"])
     parser.add_argument("--cache_dir", default="llm_weights", type=str )
     parser.add_argument('--use_variant', action="store_true", help="whether to use the wanda variant described in the appendix")
@@ -218,6 +219,8 @@ def main():
                         help='Also prune the LM head using magnitude when running NeuronRank unstructured pruning.')
     parser.add_argument('--pruning_last', type=int, default=None,
                         help='Only prune the last X MLP blocks of the model. If specified, only MLP layers in the last X transformer layers will be pruned (no attention layers).')
+    parser.add_argument('--nr-pca-components', dest='nr_pca_components', type=int, default=128,
+                        help='Number of PCA components to use for PCA+QDA scoring (default: 128)')
 
     # NeuronRank-OLD TF-IDF formula arguments
     parser.add_argument('--weight-exp', dest='weight_exp', type=float, default=1.0,
@@ -332,6 +335,8 @@ def main():
             prune_neuronrank_last(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m)
         elif args.prune_method == "neuronrank_qda":
             prune_neuronrank_qda(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m)
+        elif args.prune_method == "neuronrank_pca_qda":
+            prune_neuronrank_pca_qda(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m)
         elif args.prune_method == "neuronrank_between":
             prune_neuronrank_between(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m)
         elif args.prune_method == "neuronrank_fisher":
