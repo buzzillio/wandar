@@ -2,6 +2,13 @@
 
 ## ✅ Completed Implementation
 
+### 🔄 Recent Update (NeuronRank Fisher)
+
+**`lib/prune.py` / `main.py`**
+- Added `prune_neuronrank_fisher` entry point leveraging the new Fisher LDA scores.
+- Hooks into the CLI via `--prune_method neuronrank_fisher` and reuses the existing NeuronRank statistics.
+- Requires token-class tracking (`--neuronrank-max-classes > 0`) to score neurons by between/within-class variance.
+
 Successfully implemented three variants of Wanda enhanced with selectivity metrics:
 
 ### 1. Core Components
