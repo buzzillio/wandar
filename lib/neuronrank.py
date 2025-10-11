@@ -355,6 +355,57 @@ def compute_neuronrank_class_scores(stats, min_value: float = 0.0):
     return scores
 
 
+def compute_neuronrank_between_scores(stats, weighted: bool = True, eps: float = 1e-12):
+    """Compute simple between-class variance per neuron using class means.
+
+    If weighted=True, use class priors by counts:
+        between_j = sum_k p_k (mu_kj - mu_bar_j)^2
+    else (unweighted):
+        between_j = mean_k (mu_kj - mu_bar_j)^2
+    """
+    scores = {}
+    for layer_idx, layer_stats in stats.items():
+        token_mean = layer_stats.get("token_mean")
+        class_means = layer_stats.get("class_means")
+        class_counts = layer_stats.get("class_count")
+
+        if token_mean is None or class_means is None:
+            continue
+
+        means = class_means
+        if not torch.is_tensor(means):
+            continue
+
+        if weighted:
+            counts = class_counts
+            if counts is None or not torch.is_tensor(counts):
+                continue
+            valid = counts > 0
+            if not valid.any():
+                continue
+            counts_valid = counts[valid]
+            means_valid = means[valid]
+            total = counts_valid.sum()
+            if total <= 0:
+                continue
+            priors = (counts_valid / total).unsqueeze(1)
+            diff = means_valid - token_mean.unsqueeze(0)
+            between = (priors * (diff * diff)).sum(dim=0)
+        else:
+            # unweighted: average across non-zero classes
+            # mask rows with any nonzero count if available
+            if class_counts is not None and torch.is_tensor(class_counts):
+                valid = class_counts > 0
+                if valid.any():
+                    means = means[valid]
+            diff = means - token_mean.unsqueeze(0)
+            between = (diff * diff).mean(dim=0)
+
+        between = torch.nan_to_num(between, nan=0.0, posinf=0.0, neginf=0.0)
+        scores[layer_idx] = {"channel": between.clamp_min(0.0)}
+
+    return scores
+
 def compute_neuronrank_qda_scores(stats, eps: float = 1e-12):
     """Compute QDA-inspired per-neuron scores using class means and variances.
 

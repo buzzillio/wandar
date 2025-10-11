@@ -54,6 +54,7 @@ from lib.prune import (
     prune_neuronrank_tfidf,
     prune_neuronrank_last,
     prune_neuronrank_qda,
+    prune_neuronrank_between,
     prune_hybrid,
     prune_wanda_idf,
     prune_wanda_spiky,
@@ -182,7 +183,7 @@ def main():
     parser.add_argument("--prune_method", type=str, choices=["magnitude", "wanda", "sparsegpt", 
                         "ablate_mag_seq", "ablate_wanda_seq", "ablate_mag_iter", "ablate_wanda_iter", "search", 
                         "neuronrank", "neuronrank_unstructured", "neuronrank_variance", "neuronrank_old",
-                        "neuronrank_tfidf", "neuronrank_last", "neuronrank_qda", "hybrid",
+                        "neuronrank_tfidf", "neuronrank_last", "neuronrank_qda", "neuronrank_between", "hybrid",
                         "wanda_idf", "wanda_spiky", "wanda_selective"])
     parser.add_argument("--cache_dir", default="llm_weights", type=str )
     parser.add_argument('--use_variant', action="store_true", help="whether to use the wanda variant described in the appendix")
@@ -331,6 +332,8 @@ def main():
             prune_neuronrank_last(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m)
         elif args.prune_method == "neuronrank_qda":
             prune_neuronrank_qda(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m)
+        elif args.prune_method == "neuronrank_between":
+            prune_neuronrank_between(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m)
         elif args.prune_method == "neuronrank_fisher":
             prune_neuronrank_fisher(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m)
         elif args.prune_method == "hybrid":
