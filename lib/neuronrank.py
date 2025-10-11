@@ -390,6 +390,14 @@ def compute_neuronrank_fisher_scores(stats, eps: float = 1e-12):
         total_variance = token_var.clamp_min(0.0)
         within = (total_variance - between).clamp_min(0.0)
 
+        # --- Start Debug Logging ---
+        if layer_idx < 3: # Log for first 3 layers
+            print(f"\n--- Fisher Score Debug: Layer {layer_idx} ---")
+            print(f"  Total Variance | min: {total_variance.min():.6f}, max: {total_variance.max():.6f}, mean: {total_variance.mean():.6f}")
+            print(f"  Between-Class  | min: {between.min():.6f}, max: {between.max():.6f}, mean: {between.mean():.6f}")
+            print(f"  Within-Class   | min: {within.min():.6f}, max: {within.max():.6f}, mean: {within.mean():.6f}")
+        # --- End Debug Logging ---
+
         fisher_ratio = between / (within + eps)
         fisher_ratio = torch.nan_to_num(
             fisher_ratio,
@@ -397,6 +405,13 @@ def compute_neuronrank_fisher_scores(stats, eps: float = 1e-12):
             posinf=torch.finfo(fisher_ratio.dtype).max,
             neginf=0.0,
         )
+
+        # --- Start Debug Logging ---
+        if layer_idx < 3:
+            print(f"  Fisher Ratio   | min: {fisher_ratio.min():.6f}, max: {fisher_ratio.max():.6f}, mean: {fisher_ratio.mean():.6f}")
+            print(f"--- End Debug: Layer {layer_idx} ---\n")
+        # --- End Debug Logging ---
+
         fisher_scores[layer_idx] = {"channel": fisher_ratio}
 
     return fisher_scores
