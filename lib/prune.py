@@ -554,13 +554,18 @@ def prune_neuronrank_fisher(args, model, tokenizer, device=torch.device("cuda:0"
             if neuron_scores is None:
                 continue
             var = neuron_scores.to(weight.device, dtype=torch.float32)
+            # Normalize and floor to keep strictly positive scaling
+            mean_val = var.mean().clamp_min(1e-12)
+            scale = (var / mean_val).clamp_min(1e-6)
             # broadcast scores to weight matrix
             if "gate_proj" in name or "up_proj" in name:
-                metric = var.view(-1, 1).expand_as(weight)
+                metric = scale.view(-1, 1).expand_as(weight)
             elif "down_proj" in name:
-                metric = var.view(1, -1).expand_as(weight)
+                metric = scale.view(1, -1).expand_as(weight)
             else:
-                metric = var.view(-1, 1).expand_as(weight)  # fallback
+                metric = scale.view(-1, 1).expand_as(weight)  # fallback
+            # combine with weight magnitude to match magnitude pipeline behavior
+            metric = torch.abs(weight).to(torch.float32) * metric
             # sanitize metric
             metric = torch.nan_to_num(metric, nan=0.0, posinf=0.0, neginf=0.0)
             if torch.count_nonzero(metric).item() == 0:
