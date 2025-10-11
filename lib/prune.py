@@ -8,7 +8,7 @@ from .data import get_loaders
 from .neuronrank import (
     collect_neuronrank_statistics,
     compute_neuronrank_scores,
-    compute_neuronrank_fisher_scores,
+    compute_neuronrank_qda_scores,
     apply_neuronrank_pruning,
 )
 from .wanda_selectivity import collect_wanda_selectivity_stats
@@ -496,20 +496,20 @@ def prune_neuronrank_unstructured(args, model, tokenizer, device=torch.device("c
         print(f"[NeuronRank-Unstructured] global pruning ratio {pct:.2f}% ({total_pruned}/{total_weights})")
 
 
-def prune_neuronrank_fisher(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0, prune_m=0):
+def prune_neuronrank_qda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0, prune_m=0):
     if prune_n != 0 or prune_m != 0:
-        raise ValueError("NeuronRank Fisher pruning does not support N:M sparsity.")
+        raise ValueError("NeuronRank QDA pruning does not support N:M sparsity.")
 
     if args.sparsity_type != "unstructured":
-        raise ValueError("NeuronRank Fisher pruning currently supports only unstructured sparsity type.")
+        raise ValueError("NeuronRank QDA pruning currently supports only unstructured sparsity type.")
 
     if args.neuronrank_max_classes <= 0:
-        raise ValueError("NeuronRank Fisher pruning requires --neuronrank-max-classes > 0 to collect class statistics.")
+        raise ValueError("NeuronRank QDA pruning requires --neuronrank-max-classes > 0 to collect class statistics.")
 
     use_cache = model.config.use_cache
     model.config.use_cache = False
 
-    print("Loading calibration data for NeuronRank-Fisher...")
+    print("Loading calibration data for NeuronRank-QDA...")
     dataloader, _ = get_loaders(
         "c4",
         nsamples=args.nsamples,
@@ -518,7 +518,7 @@ def prune_neuronrank_fisher(args, model, tokenizer, device=torch.device("cuda:0"
         tokenizer=tokenizer,
     )
 
-    print("Collecting activation statistics for Fisher scoring...")
+    print("Collecting activation statistics for QDA scoring...")
     stats = collect_neuronrank_statistics(
         model,
         dataloader,
@@ -527,60 +527,54 @@ def prune_neuronrank_fisher(args, model, tokenizer, device=torch.device("cuda:0"
         max_classes=args.neuronrank_max_classes,
     )
 
-    fisher_scores = compute_neuronrank_fisher_scores(stats)
-    if not fisher_scores:
-        raise RuntimeError("NeuronRank Fisher pruning could not compute any scores; ensure calibration data and class tracking are available.")
+    qda_scores = compute_neuronrank_qda_scores(stats)
+    if not qda_scores:
+        raise RuntimeError("NeuronRank QDA pruning could not compute any scores; ensure calibration data and class tracking are available.")
 
-    # Unstructured pruning using Fisher LDA scores (per-weight masking)
+    # Unstructured pruning using QDA scores: |W| * qda_factor (broadcast per neuron)
     total_pruned = 0
     total_weights = 0
     layers = model.model.layers
     total_layers = len(layers)
     for i, layer in enumerate(layers):
         subset = find_layers(layer)
-        # apply --pruning_last filter at module level
         for name, module in subset.items():
             if not should_prune_module(args, i, total_layers, name):
                 if args.pruning_last is not None:
-                    print(f"[NeuronRank-Fisher] Skipping layer {i} module {name} (not in last {args.pruning_last} MLP layers)")
+                    print(f"[NeuronRank-QDA] Skipping layer {i} module {name} (not in last {args.pruning_last} MLP layers)")
                 continue
             if "mlp" not in name:
                 continue
             weight = module.weight.data
             if args.sparsity_ratio <= 0:
                 continue
-            # get neuron-level Fisher scores for this layer
-            neuron_scores = fisher_scores.get(i, {}).get("channel")
+            neuron_scores = qda_scores.get(i, {}).get("channel")
             if neuron_scores is None:
                 continue
-            var = neuron_scores.to(weight.device, dtype=torch.float32)
-            # Normalize and floor to keep strictly positive scaling
-            mean_val = var.mean().clamp_min(1e-12)
-            scale = (var / mean_val).clamp_min(1e-6)
-            # broadcast scores to weight matrix
+            scale = neuron_scores.to(weight.device, dtype=torch.float32)
+            mean_val = scale.mean().clamp_min(1e-12)
+            scale = (scale / mean_val).clamp_min(1e-6)
             if "gate_proj" in name or "up_proj" in name:
-                metric = scale.view(-1, 1).expand_as(weight)
+                factor = scale.view(-1, 1).expand_as(weight)
             elif "down_proj" in name:
-                metric = scale.view(1, -1).expand_as(weight)
+                factor = scale.view(1, -1).expand_as(weight)
             else:
-                metric = scale.view(-1, 1).expand_as(weight)  # fallback
-            # combine with weight magnitude to match magnitude pipeline behavior
-            metric = torch.abs(weight).to(torch.float32) * metric
-            # sanitize metric
+                factor = scale.view(-1, 1).expand_as(weight)
+            metric = torch.abs(weight).to(torch.float32) * factor
             metric = torch.nan_to_num(metric, nan=0.0, posinf=0.0, neginf=0.0)
             if torch.count_nonzero(metric).item() == 0:
                 continue
             pruned, numel = _apply_unstructured_mask(weight, metric, args.sparsity_ratio)
             total_pruned += pruned
             total_weights += numel
-            print(f"[NeuronRank-Fisher] layer {i} module {name} pruned {pruned}/{numel}")
+            print(f"[NeuronRank-QDA] layer {i} module {name} pruned {pruned}/{numel}")
     model.config.use_cache = use_cache
     torch.cuda.empty_cache()
     if total_weights:
         pct = 100.0 * total_pruned / total_weights
-        print(f"[NeuronRank-Fisher] global pruning ratio {pct:.2f}% ({total_pruned}/{total_weights})")
+        print(f"[NeuronRank-QDA] global pruning ratio {pct:.2f}% ({total_pruned}/{total_weights})")
     else:
-        print("[NeuronRank-Fisher] No weights were pruned.")
+        print("[NeuronRank-QDA] No weights were pruned.")
 
 
 def prune_neuronrank_old(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0, prune_m=0):

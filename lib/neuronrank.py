@@ -169,6 +169,7 @@ def collect_neuronrank_statistics(model, dataloader, tokenizer, device, max_clas
             "sample": RunningStats(gate_proj.out_features, dtype=layer_dtype, device=layer_device),
             "token": RunningStats(gate_proj.out_features, dtype=layer_dtype, device=layer_device),
             "class_sum": torch.zeros((num_classes, gate_proj.out_features), dtype=layer_dtype, device=layer_device) if num_classes else None,
+            "class_sq_sum": torch.zeros((num_classes, gate_proj.out_features), dtype=layer_dtype, device=layer_device) if num_classes else None,
             "class_count": torch.zeros(num_classes, dtype=layer_dtype, device=layer_device) if num_classes else None,
         }
 
@@ -209,6 +210,7 @@ def collect_neuronrank_statistics(model, dataloader, tokenizer, device, max_clas
                     idxs = class_indices[valid_mask]
                     token_values = per_token_local[within_vocab][valid_mask]
                     layer_stats[idx]["class_sum"].index_add_(0, idxs, token_values)
+                    layer_stats[idx]["class_sq_sum"].index_add_(0, idxs, token_values * token_values)
                     layer_stats[idx]["class_count"].index_add_(0, idxs, torch.ones(idxs.size(0), dtype=layer_dtype, device=token_values.device))
 
             return hook
@@ -243,18 +245,26 @@ def collect_neuronrank_statistics(model, dataloader, tokenizer, device, max_clas
 
         class_var = None
         class_sum_cpu = None
+        class_sq_sum_cpu = None
         class_count_cpu = None
         class_means_cpu = None
+        class_vars_cpu = None
 
         class_sum = stat.get("class_sum")
+        class_sq_sum = stat.get("class_sq_sum")
         class_count = stat.get("class_count")
-        if class_sum is not None and class_count is not None:
+        if class_sum is not None and class_sq_sum is not None and class_count is not None:
             class_sum_cpu = class_sum.to(dtype=torch.float32, device="cpu")
+            class_sq_sum_cpu = class_sq_sum.to(dtype=torch.float32, device="cpu")
             class_count_cpu = class_count.to(dtype=torch.float32, device="cpu")
             valid = class_count_cpu > 0
             if valid.any():
                 class_means_cpu = torch.zeros_like(class_sum_cpu)
                 class_means_cpu[valid] = class_sum_cpu[valid] / class_count_cpu[valid].unsqueeze(1)
+                # compute class variances (diagonal assumption)
+                class_vars_cpu = torch.zeros_like(class_sum_cpu)
+                class_vars_cpu[valid] = (class_sq_sum_cpu[valid] / class_count_cpu[valid].unsqueeze(1)) - class_means_cpu[valid] * class_means_cpu[valid]
+                class_vars_cpu = torch.clamp(class_vars_cpu, min=0.0)
                 nonzero_means = class_means_cpu[valid]
                 if nonzero_means.size(0) > 1:
                     class_var = nonzero_means.var(dim=0, unbiased=False)
@@ -270,8 +280,10 @@ def collect_neuronrank_statistics(model, dataloader, tokenizer, device, max_clas
             "token_mean": token_mean,
             "token_count": token_count,
             "class_sum": class_sum_cpu,
+            "class_sq_sum": class_sq_sum_cpu,
             "class_count": class_count_cpu,
             "class_means": class_means_cpu,
+            "class_vars": class_vars_cpu,
         }
     return stats
 
@@ -343,78 +355,51 @@ def compute_neuronrank_class_scores(stats, min_value: float = 0.0):
     return scores
 
 
-def compute_neuronrank_fisher_scores(stats, eps: float = 1e-12):
-    """Compute Fisher LDA-inspired scores per neuron.
+def compute_neuronrank_qda_scores(stats, eps: float = 1e-12):
+    """Compute QDA-inspired per-neuron scores using class means and variances.
 
-    For each neuron we derive a channel score proportional to the ratio
-    between the between-class variance and the within-class variance:
-
-        J = sigma_between^2 / (sigma_within^2 + eps)
-
-    where the class statistics are obtained from the tracked token classes
-    during calibration.
+    We assume diagonal covariance per neuron. For each neuron j, compute
+    score_j = sum_k p_k * (mu_kj - mu_bar_j)^2 / (var_kj + eps)
+    where p_k are class priors (by counts), mu_bar is overall mean.
     """
-
-    fisher_scores: Dict[int, Dict[str, torch.Tensor]] = {}
+    qda_scores: Dict[int, Dict[str, torch.Tensor]] = {}
 
     for layer_idx, layer_stats in stats.items():
-        token_var = layer_stats.get("token_variance")
         token_mean = layer_stats.get("token_mean")
         class_means = layer_stats.get("class_means")
+        class_vars = layer_stats.get("class_vars")
         class_counts = layer_stats.get("class_count")
-        total_count = layer_stats.get("token_count", 0.0)
 
-        if token_var is None or token_mean is None:
-            continue
-        if class_means is None or class_counts is None:
+        if token_mean is None or class_means is None or class_vars is None or class_counts is None:
             continue
 
         counts = class_counts
         means = class_means
-        if not torch.is_tensor(counts) or not torch.is_tensor(means):
+        vars_ = class_vars
+        if not (torch.is_tensor(counts) and torch.is_tensor(means) and torch.is_tensor(vars_)):
             continue
 
-        valid = counts > 0
+        valid = counts > 1  # need at least 2 to estimate variance
         if not valid.any():
             continue
 
         counts_valid = counts[valid]
         means_valid = means[valid]
+        vars_valid = vars_[valid]
         total = counts_valid.sum()
         if total <= 0:
             continue
 
-        overall_mean = token_mean
-        between = (counts_valid.unsqueeze(1) * (means_valid - overall_mean.unsqueeze(0)) ** 2).sum(dim=0) / total
+        priors = (counts_valid / total).unsqueeze(1)  # [K,1]
+        diff = means_valid - token_mean.unsqueeze(0)   # [K, D]
+        denom = vars_valid + eps                       # [K, D]
+        contrib = priors * (diff * diff) / denom       # [K, D]
+        score = contrib.sum(dim=0)                     # [D]
+        # sanitize and clamp
+        score = torch.nan_to_num(score, nan=0.0, posinf=torch.finfo(score.dtype).max, neginf=0.0)
+        qda_scores[layer_idx] = {"channel": score}
 
-        total_variance = token_var.clamp_min(0.0)
-        within = (total_variance - between).clamp_min(0.0)
-
-        # --- Start Debug Logging ---
-        if layer_idx < 3: # Log for first 3 layers
-            print(f"\n--- Fisher Score Debug: Layer {layer_idx} ---")
-            print(f"  Total Variance | min: {total_variance.min():.6f}, max: {total_variance.max():.6f}, mean: {total_variance.mean():.6f}")
-            print(f"  Between-Class  | min: {between.min():.6f}, max: {between.max():.6f}, mean: {between.mean():.6f}")
-            print(f"  Within-Class   | min: {within.min():.6f}, max: {within.max():.6f}, mean: {within.mean():.6f}")
-        # --- End Debug Logging ---
-
-        fisher_ratio = between / (within + eps)
-        fisher_ratio = torch.nan_to_num(
-            fisher_ratio,
-            nan=0.0,
-            posinf=torch.finfo(fisher_ratio.dtype).max,
-            neginf=0.0,
-        )
-
-        # --- Start Debug Logging ---
-        if layer_idx < 3:
-            print(f"  Fisher Ratio   | min: {fisher_ratio.min():.6f}, max: {fisher_ratio.max():.6f}, mean: {fisher_ratio.mean():.6f}")
-            print(f"--- End Debug: Layer {layer_idx} ---\n")
-        # --- End Debug Logging ---
-
-        fisher_scores[layer_idx] = {"channel": fisher_ratio}
-
-    return fisher_scores
+    return qda_scores
 
 
 def apply_neuronrank_pruning(model, scores, sparsity_ratio):
