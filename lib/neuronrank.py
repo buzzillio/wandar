@@ -391,6 +391,12 @@ def compute_neuronrank_fisher_scores(stats, eps: float = 1e-12):
         within = (total_variance - between).clamp_min(0.0)
 
         fisher_ratio = between / (within + eps)
+        fisher_ratio = torch.nan_to_num(
+            fisher_ratio,
+            nan=0.0,
+            posinf=torch.finfo(fisher_ratio.dtype).max,
+            neginf=0.0,
+        )
         fisher_scores[layer_idx] = {"channel": fisher_ratio}
 
     return fisher_scores
