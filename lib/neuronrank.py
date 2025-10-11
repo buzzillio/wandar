@@ -453,6 +453,86 @@ def compute_neuronrank_qda_scores(stats, eps: float = 1e-12):
     return qda_scores
 
 
+def compute_neuronrank_mahalanobis_scores(stats, eps: float = 1e-12, use_pooled_cov: bool = False):
+    """Compute proper QDA discriminability scores using Mahalanobis distance.
+    
+    For each neuron, computes discriminability as the sum of weighted squared 
+    Mahalanobis distances from the overall mean to each class mean:
+    
+        score_j = Σ_k p_k * d²_M(μ_kj, μ̄_j)
+    
+    where d²_M = (μ_kj - μ̄_j)² / σ²_kj  (per-class covariance)
+    or    d²_M = (μ_kj - μ̄_j)² / σ²_pooled  (pooled covariance)
+    
+    This is the true QDA criterion: neurons with high Mahalanobis distance
+    between class means are most discriminative.
+    
+    Args:
+        stats: NeuronRank statistics with class means, vars, counts
+        eps: Numerical stability constant
+        use_pooled_cov: If True, use pooled within-class covariance (LDA-like)
+                       If False, use per-class covariance (true QDA)
+    """
+    mahal_scores: Dict[int, Dict[str, torch.Tensor]] = {}
+
+    for layer_idx, layer_stats in stats.items():
+        token_mean = layer_stats.get("token_mean")
+        token_var = layer_stats.get("token_variance")
+        class_means = layer_stats.get("class_means")
+        class_vars = layer_stats.get("class_vars")
+        class_counts = layer_stats.get("class_count")
+
+        if token_mean is None or class_means is None or class_counts is None:
+            continue
+
+        counts = class_counts
+        means = class_means
+        if not (torch.is_tensor(counts) and torch.is_tensor(means)):
+            continue
+
+        valid = counts > 1
+        if not valid.any():
+            continue
+
+        counts_valid = counts[valid]
+        means_valid = means[valid]
+        total = counts_valid.sum()
+        if total <= 0:
+            continue
+
+        # Priors
+        priors = (counts_valid / total).unsqueeze(1)  # [K, 1]
+        
+        # Differences from overall mean
+        diff = means_valid - token_mean.unsqueeze(0)  # [K, D]
+        
+        # Compute Mahalanobis distance
+        if use_pooled_cov:
+            # LDA-style: use pooled (overall) variance
+            if token_var is None:
+                # Fallback to between-class variance
+                score = (priors * (diff * diff)).sum(dim=0)
+            else:
+                pooled_var = token_var.unsqueeze(0)  # [1, D]
+                mahal_sq = (diff * diff) / (pooled_var + eps)  # [K, D]
+                score = (priors * mahal_sq).sum(dim=0)  # [D]
+        else:
+            # True QDA: use per-class variances
+            if class_vars is None:
+                # Fallback to simple between-class variance
+                score = (priors * (diff * diff)).sum(dim=0)
+            else:
+                vars_valid = class_vars[valid]
+                mahal_sq = (diff * diff) / (vars_valid + eps)  # [K, D]
+                score = (priors * mahal_sq).sum(dim=0)  # [D]
+        
+        # Sanitize
+        score = torch.nan_to_num(score, nan=0.0, posinf=torch.finfo(score.dtype).max, neginf=0.0)
+        mahal_scores[layer_idx] = {"channel": score.clamp_min(0.0)}
+
+    return mahal_scores
+
+
 def compute_neuronrank_pca_qda_scores(stats, pca_components: int = 128, eps: float = 1e-12):
     """Compute PCA+QDA scores: project to PCA space, then apply QDA discriminant analysis.
     

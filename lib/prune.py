@@ -10,6 +10,7 @@ from .neuronrank import (
     compute_neuronrank_scores,
     compute_neuronrank_qda_scores,
     compute_neuronrank_pca_qda_scores,
+    compute_neuronrank_mahalanobis_scores,
     compute_neuronrank_between_scores,
     apply_neuronrank_pruning,
 )
@@ -662,6 +663,91 @@ def prune_neuronrank_pca_qda(args, model, tokenizer, device=torch.device("cuda:0
         print(f"[NeuronRank-PCA+QDA] global pruning ratio {pct:.2f}% ({total_pruned}/{total_weights})")
     else:
         print("[NeuronRank-PCA+QDA] No weights were pruned.")
+
+
+def prune_neuronrank_mahalanobis(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0, prune_m=0):
+    if prune_n != 0 or prune_m != 0:
+        raise ValueError("NeuronRank Mahalanobis pruning does not support N:M sparsity.")
+
+    if args.sparsity_type != "unstructured":
+        raise ValueError("NeuronRank Mahalanobis pruning currently supports only unstructured sparsity type.")
+
+    if args.neuronrank_max_classes <= 0:
+        raise ValueError("NeuronRank Mahalanobis pruning requires --neuronrank-max-classes > 0 to collect class statistics.")
+
+    use_cache = model.config.use_cache
+    model.config.use_cache = False
+
+    print("Loading calibration data for NeuronRank-Mahalanobis...")
+    dataloader, _ = get_loaders(
+        "c4",
+        nsamples=args.nsamples,
+        seed=args.seed,
+        seqlen=model.seqlen,
+        tokenizer=tokenizer,
+    )
+
+    print("Collecting activation statistics for Mahalanobis distance scoring...")
+    stats = collect_neuronrank_statistics(
+        model,
+        dataloader,
+        tokenizer,
+        device,
+        max_classes=args.neuronrank_max_classes,
+    )
+
+    # Use pooled covariance (like LDA) or per-class (full QDA)
+    use_pooled = getattr(args, 'nr_mahalanobis_pooled', False)
+    print(f"Computing Mahalanobis distance scores (pooled={use_pooled})...")
+    
+    mahalanobis_scores = compute_neuronrank_mahalanobis_scores(stats, use_pooled_cov=use_pooled)
+    if not mahalanobis_scores:
+        raise RuntimeError("NeuronRank Mahalanobis pruning could not compute any scores; ensure calibration data and class tracking are available.")
+
+    # Unstructured per-weight masking: |W| * mahalanobis_factor
+    total_pruned = 0
+    total_weights = 0
+    layers = model.model.layers
+    total_layers = len(layers)
+    for i, layer in enumerate(layers):
+        subset = find_layers(layer)
+        for name, module in subset.items():
+            if not should_prune_module(args, i, total_layers, name):
+                if args.pruning_last is not None:
+                    print(f"[NeuronRank-Mahalanobis] Skipping layer {i} module {name} (not in last {args.pruning_last} MLP layers)")
+                continue
+            if "mlp" not in name:
+                continue
+            weight = module.weight.data
+            if args.sparsity_ratio <= 0:
+                continue
+            neuron_scores = mahalanobis_scores.get(i, {}).get("channel")
+            if neuron_scores is None:
+                continue
+            factor = neuron_scores.to(weight.device, dtype=torch.float32)
+            mean_val = factor.mean().clamp_min(1e-12)
+            factor = (factor / mean_val).clamp_min(1e-6)
+            if "gate_proj" in name or "up_proj" in name:
+                metric = factor.view(-1, 1).expand_as(weight)
+            elif "down_proj" in name:
+                metric = factor.view(1, -1).expand_as(weight)
+            else:
+                metric = factor.view(-1, 1).expand_as(weight)
+            metric = torch.abs(weight).to(torch.float32) * metric
+            metric = torch.nan_to_num(metric, nan=0.0, posinf=0.0, neginf=0.0)
+            if torch.count_nonzero(metric).item() == 0:
+                continue
+            pruned, numel = _apply_unstructured_mask(weight, metric, args.sparsity_ratio)
+            total_pruned += pruned
+            total_weights += numel
+            print(f"[NeuronRank-Mahalanobis] layer {i} module {name} pruned {pruned}/{numel}")
+    model.config.use_cache = use_cache
+    torch.cuda.empty_cache()
+    if total_weights:
+        pct = 100.0 * total_pruned / total_weights
+        print(f"[NeuronRank-Mahalanobis] global pruning ratio {pct:.2f}% ({total_pruned}/{total_weights})")
+    else:
+        print("[NeuronRank-Mahalanobis] No weights were pruned.")
 
 
 def prune_neuronrank_between(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0, prune_m=0):
